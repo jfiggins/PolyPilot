@@ -3131,7 +3131,39 @@ else
             footerStatus = "⏳ Launching copilot…";
             StateHasChanged();
 
-            var prompt = BuildCopilotPrompt(desc, debugInfo, branchName);
+            // Determine origin repo owner/name so PRs target the fork, not upstream
+            string? originOwnerRepo = null;
+            if (polypilotRepo?.Url != null)
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    polypilotRepo.Url, @"github\.com[/:]([^/]+/[^/.]+)");
+                if (m.Success) originOwnerRepo = m.Groups[1].Value;
+            }
+            if (originOwnerRepo == null)
+            {
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo("git", "remote get-url origin")
+                    {
+                        WorkingDirectory = worktreePath,
+                        RedirectStandardOutput = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    var p = System.Diagnostics.Process.Start(psi);
+                    if (p != null)
+                    {
+                        var remoteUrl = (await p.StandardOutput.ReadToEndAsync()).Trim();
+                        await p.WaitForExitAsync();
+                        var m = System.Text.RegularExpressions.Regex.Match(
+                            remoteUrl, @"github\.com[/:]([^/]+/[^/.]+)");
+                        if (m.Success) originOwnerRepo = m.Groups[1].Value;
+                    }
+                }
+                catch { /* best-effort — will fall back to generic instruction */ }
+            }
+
+            var prompt = BuildCopilotPrompt(desc, debugInfo, branchName, originOwnerRepo);
             var promptFile = Path.Combine(Path.GetTempPath(), $"polypilot-fix-{Guid.NewGuid():N}.md");
             await File.WriteAllTextAsync(promptFile, prompt);
 
@@ -3174,7 +3206,7 @@ else
         }
     }
 
-    private string BuildCopilotPrompt(string description, string debugInfo, string branchName)
+    private string BuildCopilotPrompt(string description, string debugInfo, string branchName, string? originRepo)
     {
         var isMultiAgent = !string.IsNullOrEmpty(selectedBugSession) &&
             CopilotService.IsSessionInMultiAgentGroup(selectedBugSession);
@@ -3217,7 +3249,7 @@ You are fixing a bug in the PolyPilot app (a .NET MAUI Blazor Hybrid app).
 7. Run `cd PolyPilot && dotnet build -f {(OperatingSystem.IsWindows() ? "net10.0-windows10.0.19041.0" : "net10.0-maccatalyst")}` to verify the app builds.
 8. **Verify your branch is based on `main`** — run `git log --oneline upstream/main..HEAD` (or `origin/main..HEAD`) and confirm only YOUR commits appear. If unrelated commits are included, the branch was created from the wrong base. Fix it: create a new branch from `upstream/main` and cherry-pick your commits onto it.
 9. Commit your changes to branch `{branchName}` with a descriptive commit message.
-10. Push the branch and create a PR against `main` in the PureWeen/PolyPilot repository using `gh pr create`.
+10. Push the branch and create a PR against `main` in {(originRepo != null ? $"the {originRepo} repository" : "your fork")} using `gh pr create{(originRepo != null ? $" -R {originRepo}" : "")}`. Do NOT open PRs against the upstream/main repository.
 {multiAgentSection}
 Important conventions:
 - Never use `static readonly` fields that call platform APIs (use lazy `??=` properties instead).
