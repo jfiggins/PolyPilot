@@ -113,10 +113,27 @@ public class GitAutoUpdateService : IDisposable
                 return;
             }
 
-            await RunGit("fetch origin main --quiet");
+            // Determine which remote to track. If an 'upstream' remote exists,
+            // this is a fork — fetch and compare against upstream directly.
+            // Otherwise use origin (standard non-fork setup).
+            string updateRemote;
+            try
+            {
+                var remotes = (await RunGit("remote")).Trim();
+                var hasUpstream = remotes
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Any(r => r.Trim().Equals("upstream", StringComparison.OrdinalIgnoreCase));
+                updateRemote = hasUpstream ? "upstream" : "origin";
+            }
+            catch
+            {
+                updateRemote = "origin";
+            }
+
+            await RunGit($"fetch {updateRemote} main --quiet");
 
             var local = (await RunGit("rev-parse HEAD")).Trim();
-            var remote = (await RunGit("rev-parse origin/main")).Trim();
+            var remote = (await RunGit($"rev-parse {updateRemote}/main")).Trim();
 
             if (local == remote)
             {
@@ -129,13 +146,103 @@ public class GitAutoUpdateService : IDisposable
                 return;
             }
 
-            // Count commits behind
-            var behindCount = (await RunGit("rev-list --count HEAD..origin/main")).Trim();
+            // Only update if there are new upstream commits to incorporate.
+            // For forks: local may have commits beyond upstream — that's fine as long as
+            // upstream/main is an ancestor of HEAD (we already have all upstream changes).
+            var isLocalBehind = false;
+            try
+            {
+                await RunGit($"merge-base --is-ancestor HEAD {updateRemote}/main");
+                // HEAD is an ancestor of remote — we're strictly behind, fast-forward is possible
+                isLocalBehind = true;
+            }
+            catch
+            {
+                // HEAD is NOT an ancestor of remote — check the reverse: is remote an ancestor of us?
+                try
+                {
+                    await RunGit($"merge-base --is-ancestor {updateRemote}/main HEAD");
+                    // Remote is already contained in our history — we're ahead, nothing to pull
+                    _status = $"Up to date (ahead of {updateRemote}/main)";
+                    NotifyChanged();
+                    return;
+                }
+                catch
+                {
+                    // True divergence: both sides have unique commits. Try rebase for forks.
+                    if (updateRemote == "upstream")
+                    {
+                        _status = $"Rebasing onto {updateRemote}/main...";
+                        NotifyChanged();
+                        try
+                        {
+                            await RunGit($"rebase {updateRemote}/main");
+                            // Rebase succeeded — force-push to keep fork in sync
+                            try
+                            {
+                                await RunGit("push origin main --force-with-lease --quiet");
+                                _logger.LogInformation("Fork rebased and force-pushed to origin");
+                            }
+                            catch (Exception pushEx)
+                            {
+                                _logger.LogWarning(pushEx, "Rebase succeeded but force-push to origin failed");
+                            }
+                            // Continue to rebuild below
+                            goto rebuild;
+                        }
+                        catch (Exception rebaseEx)
+                        {
+                            // Rebase had conflicts — attempt auto-resolution preferring upstream
+                            _logger.LogWarning(rebaseEx, "Rebase onto upstream/main had conflicts — attempting auto-resolve");
+                            if (await TryAutoResolveRebaseConflicts())
+                            {
+                                // Auto-resolve succeeded — force-push to keep fork in sync
+                                try
+                                {
+                                    await RunGit("push origin main --force-with-lease --quiet");
+                                    _logger.LogInformation("Fork rebased (auto-resolved) and force-pushed to origin");
+                                }
+                                catch (Exception pushEx)
+                                {
+                                    _logger.LogWarning(pushEx, "Rebase succeeded but force-push to origin failed");
+                                }
+                                goto rebuild;
+                            }
+                            // Auto-resolve failed — already aborted inside TryAutoResolveRebaseConflicts
+                            _status = $"Rebase conflict with {updateRemote}/main — auto-resolve failed, skipping";
+                            NotifyChanged();
+                            return;
+                        }
+                    }
+
+                    _status = $"Diverged from {updateRemote}/main — skipping";
+                    NotifyChanged();
+                    return;
+                }
+            }
+
+            var behindCount = (await RunGit($"rev-list --count HEAD..{updateRemote}/main")).Trim();
             _status = $"Updating ({behindCount} new commit{(behindCount == "1" ? "" : "s")})...";
             NotifyChanged();
 
-            var pullResult = await RunGit("pull origin main --ff-only");
+            var pullResult = await RunGit($"pull {updateRemote} main --ff-only");
             _logger.LogInformation("Pulled updates: {Result}", pullResult.Trim());
+
+            // If pulling from upstream on a fork, also push to origin to keep fork in sync
+            if (updateRemote == "upstream")
+            {
+                try
+                {
+                    await RunGit("push origin main --quiet");
+                    _logger.LogDebug("Fork synced: pushed to origin after upstream pull");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to push to fork origin — fork may be out of sync");
+                }
+            }
+
+            rebuild:
 
             _status = "Rebuilding & relaunching...";
             NotifyChanged();
@@ -154,7 +261,91 @@ public class GitAutoUpdateService : IDisposable
         }
     }
 
-    private async Task<string> RunGit(string args)
+    /// <summary>
+    /// Attempts to auto-resolve rebase conflicts by preferring upstream's version.
+    /// During a rebase, "ours" is the upstream base (the branch we're rebasing onto)
+    /// and "theirs" is our local commit being replayed. To prefer upstream, we use --ours.
+    /// Loops through each conflicted commit until the rebase completes or a non-resolvable
+    /// error occurs (max 50 iterations as safety bound).
+    /// </summary>
+    private async Task<bool> TryAutoResolveRebaseConflicts()
+    {
+        const int maxSteps = 50;
+        for (int step = 0; step < maxSteps; step++)
+        {
+            try
+            {
+                // Get list of conflicted files
+                var status = await RunGit("diff --name-only --diff-filter=U", throwOnError: false);
+                var conflicted = status.Trim()
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(f => f.Trim())
+                    .Where(f => !string.IsNullOrEmpty(f))
+                    .ToArray();
+
+                if (conflicted.Length == 0)
+                {
+                    // No conflicts — try to continue (may be an empty commit or rebase finished)
+                    try
+                    {
+                        await RunGit("-c core.editor=true rebase --continue");
+                    }
+                    catch
+                    {
+                        // rebase --continue can fail if rebase already finished
+                    }
+                    if (!IsRebaseInProgress()) return true;
+                    continue;
+                }
+
+                _status = $"Auto-resolving {conflicted.Length} conflict{(conflicted.Length == 1 ? "" : "s")} (step {step + 1})...";
+                NotifyChanged();
+
+                // Resolve each file preferring upstream (--ours during rebase = upstream base)
+                foreach (var file in conflicted)
+                {
+                    _logger.LogInformation("Auto-resolving conflict in {File} (preferring upstream)", file);
+                    await RunGit($"checkout --ours -- \"{file}\"");
+                    await RunGit($"add -- \"{file}\"");
+                }
+
+                // Continue the rebase with the resolved files
+                try
+                {
+                    await RunGit("-c core.editor=true rebase --continue");
+                }
+                catch
+                {
+                    // More conflicts on the next commit — loop will handle them
+                    if (!IsRebaseInProgress()) return true;
+                    continue;
+                }
+
+                if (!IsRebaseInProgress()) return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Auto-resolve step {Step} failed — aborting rebase", step);
+                try { await RunGit("rebase --abort"); } catch { }
+                return false;
+            }
+        }
+
+        // Exceeded max steps
+        if (!IsRebaseInProgress()) return true;
+        _logger.LogWarning("Auto-resolve exceeded {MaxSteps} steps — aborting rebase", maxSteps);
+        try { await RunGit("rebase --abort"); } catch { }
+        return false;
+    }
+
+    private bool IsRebaseInProgress()
+    {
+        if (_gitRoot == null) return false;
+        return Directory.Exists(Path.Combine(_gitRoot, ".git", "rebase-merge"))
+            || Directory.Exists(Path.Combine(_gitRoot, ".git", "rebase-apply"));
+    }
+
+    private async Task<string> RunGit(string args, bool throwOnError = true)
     {
         var psi = new ProcessStartInfo
         {
@@ -173,7 +364,7 @@ public class GitAutoUpdateService : IDisposable
         var error = await process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
 
-        if (process.ExitCode != 0)
+        if (process.ExitCode != 0 && throwOnError)
             throw new InvalidOperationException($"git {args} failed: {error}");
 
         return output;

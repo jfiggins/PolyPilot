@@ -191,6 +191,14 @@ public record GroupPreset(string Name, string Description, string Emoji, MultiAg
     /// </summary>
     public string?[]? WorkerDisplayNames { get; init; }
 
+    /// <summary>
+    /// Per-worker worktree flags, indexed to match WorkerModels.
+    /// true = this worker gets its own isolated worktree.
+    /// false/null = this worker shares the orchestrator's worktree.
+    /// Used with SelectiveIsolated strategy. Null array = all workers follow the group strategy.
+    /// </summary>
+    public bool[]? WorkerUseWorktree { get; init; }
+
     private const string WorkerReviewPrompt = """
         You are a PR reviewer. When assigned a PR, follow this process:
 
@@ -880,6 +888,52 @@ public static class UserPresets
         existing.Add(preset);
         Save(baseDir, existing);
         return preset;
+    }
+
+    /// <summary>
+    /// Import preset(s) from a .squad/ folder (or parent directory containing one) into presets.json.
+    /// The path can point to either a .squad/ directory or its parent.
+    /// Returns the imported presets (empty if none found).
+    /// </summary>
+    public static List<GroupPreset> ImportFromSquadFolder(string baseDir, string path)
+    {
+        var discovered = SquadDiscovery.DiscoverFromPath(path);
+        if (discovered.Count == 0) return new();
+
+        var existing = Load(baseDir);
+        var imported = new List<GroupPreset>();
+
+        foreach (var preset in discovered)
+        {
+            // Convert from repo-level to user-defined
+            var userPreset = preset with { IsUserDefined = true, IsRepoLevel = false, SourcePath = null };
+            existing.RemoveAll(p => string.Equals(p.Name, userPreset.Name, StringComparison.OrdinalIgnoreCase));
+            existing.Add(userPreset);
+            imported.Add(userPreset);
+        }
+
+        Save(baseDir, existing);
+        return imported;
+    }
+
+    /// <summary>
+    /// Export a preset to a .squad/ folder at the given target path.
+    /// Looks up the preset by name from all sources (built-in + user + repo).
+    /// Returns the path to the created .squad/ directory, or null if preset not found.
+    /// </summary>
+    public static string? ExportPresetToSquadFolder(string baseDir, string presetName, string targetPath,
+        string? repoWorkingDirectory = null)
+    {
+        var all = GetAll(baseDir, repoWorkingDirectory);
+        var preset = all.FirstOrDefault(p => string.Equals(p.Name, presetName, StringComparison.OrdinalIgnoreCase));
+        if (preset == null) return null;
+
+        try
+        {
+            Directory.CreateDirectory(targetPath);
+            return SquadWriter.WriteFromPreset(targetPath, preset);
+        }
+        catch { return null; }
     }
 }
 

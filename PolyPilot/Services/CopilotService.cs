@@ -534,6 +534,10 @@ public partial class CopilotService : IAsyncDisposable
         /// all its tool rounds. This prevents the orchestrator from doing all the work itself
         /// when it has tool access and ignores "dispatcher only" instructions.</summary>
         public bool EarlyDispatchOnWorkerBlocks;
+        /// <summary>UTC ticks when the first background-tasks idle deferral occurred this turn.
+        /// If deferred completion exceeds BackgroundTaskIdleMaxDeferSeconds, CompleteResponse
+        /// is forced to prevent orchestrator hangs when the SDK never sends a final idle.</summary>
+        public long FirstIdleDeferAtTicks;
         /// <summary>Timer that fires shortly after a tool starts to verify the connection is still alive.
         /// If no tool completion event arrives within ToolHealthCheckIntervalMs, we do an active health
         /// check to detect dead connections early (instead of waiting for the 600s watchdog timeout).</summary>
@@ -573,6 +577,17 @@ public partial class CopilotService : IAsyncDisposable
         /// for reconnected sends so a dead event stream (CLI event writer broken after re-resume)
         /// is detected in ~30s rather than waiting the full 120s.</summary>
         public volatile bool IsReconnectedSend;
+
+        /// <summary>Set to true when the watchdog kills this session's processing turn.
+        /// Cleared on the next SendPromptAsync call. The orchestrator reflect loop uses this
+        /// to distinguish "watchdog-killed truncated response" from "orchestrator refused to delegate"
+        /// — the former should retry the planning prompt, not send a nudge.</summary>
+        public volatile bool WatchdogKilledThisTurn;
+
+        /// <summary>One-shot timer that fires after BackgroundTaskIdleMaxDeferSeconds when IDLE-DEFER
+        /// defers completion due to active background tasks. If no second session.idle arrives (SDK bug),
+        /// this timer force-completes the session to prevent indefinite orchestrator hangs.</summary>
+        public Timer? IdleDeferFallbackTimer;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)
@@ -672,22 +687,27 @@ public partial class CopilotService : IAsyncDisposable
         }
     }
 
+    internal static bool ShouldPersistDiagnostic(string message)
+    {
+        return message.StartsWith("[EVT") || message.StartsWith("[IDLE") ||
+            message.StartsWith("[COMPLETE") || message.StartsWith("[SEND") ||
+            message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
+            message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
+            message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
+            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
+            message.StartsWith("[KEEPALIVE") || message.StartsWith("[ERROR") ||
+            message.StartsWith("[ABORT") || message.StartsWith("[BRIDGE") ||
+            message.Contains("watchdog") || message.Contains("Failed to");
+    }
+
     private void Debug(string message)
     {
         LastDebugMessage = message;
         Console.WriteLine($"[DEBUG] {message}");
         OnDebug?.Invoke(message);
 
-        // Persist lifecycle diagnostics to file for post-mortem analysis (DEBUG builds only)
-#if DEBUG
-        if (message.StartsWith("[EVT") || message.StartsWith("[IDLE") ||
-            message.StartsWith("[COMPLETE") || message.StartsWith("[SEND") ||
-            message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
-            message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
-            message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
-            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
-            message.StartsWith("[KEEPALIVE") ||
-            message.Contains("watchdog"))
+        // Persist lifecycle diagnostics to file for post-mortem analysis
+        if (ShouldPersistDiagnostic(message))
         {
             try
             {
@@ -704,7 +724,6 @@ public partial class CopilotService : IAsyncDisposable
             }
             catch { /* Don't let logging failures cascade */ }
         }
-#endif
     }
 
     internal void InvokeOnUI(Action action)
@@ -1420,16 +1439,32 @@ public partial class CopilotService : IAsyncDisposable
         if (bundledPath != null && File.Exists(bundledPath))
             return bundledPath;
 
+        var binaryName = OperatingSystem.IsWindows() ? "copilot.exe" : "copilot";
+
         // 2. MonoBundle/copilot (MAUI flattens runtimes/ into MonoBundle on Mac Catalyst)
         try
         {
             var assemblyDir = Path.GetDirectoryName(typeof(CopilotClient).Assembly.Location);
             if (assemblyDir != null)
             {
-                var binaryName = OperatingSystem.IsWindows() ? "copilot.exe" : "copilot";
                 var monoBundlePath = Path.Combine(assemblyDir, binaryName);
                 if (File.Exists(monoBundlePath))
                     return monoBundlePath;
+            }
+        }
+        catch { }
+
+        // 3. AppContext.BaseDirectory fallback — in Release/AOT builds, Assembly.Location
+        //    resolves to .xamarin/{arch}/ subdirectory, but the copilot binary is in the
+        //    MonoBundle root. AppContext.BaseDirectory always points to MonoBundle/.
+        try
+        {
+            var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrEmpty(baseDir))
+            {
+                var baseDirPath = Path.Combine(baseDir, binaryName);
+                if (File.Exists(baseDirPath))
+                    return baseDirPath;
             }
         }
         catch { }
@@ -2995,6 +3030,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Snapshot events.jsonl size so the watchdog can detect "dead sends" —
         // messages the SDK accepts but never writes any events for.
         state.WatchdogAbortAttempted = false;
+        state.WatchdogKilledThisTurn = false;
         try
         {
             var sid = state.Info.SessionId;
@@ -3237,8 +3273,22 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     if (!string.IsNullOrEmpty(m)) cfg.Model = m;
                                                     if (!string.IsNullOrEmpty(capturedOtherState.Info.WorkingDirectory))
                                                         cfg.WorkingDirectory = capturedOtherState.Info.WorkingDirectory;
-                                                    var resumed = await newClient.ResumeSessionAsync(
-                                                        capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    CopilotSession resumed;
+                                                    try
+                                                    {
+                                                        resumed = await newClient.ResumeSessionAsync(
+                                                            capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    }
+                                                    catch (Exception toolEx) when (
+                                                        toolEx.Message.Contains("tool name clash", StringComparison.OrdinalIgnoreCase) ||
+                                                        toolEx.Message.Contains("already registered", StringComparison.OrdinalIgnoreCase))
+                                                    {
+                                                        // Stale connection still holds tool registration — retry without external tools
+                                                        Debug($"[RECONNECT] Sibling '{capturedKey}' tool clash, retrying without external tools");
+                                                        cfg.Tools = new List<Microsoft.Extensions.AI.AIFunction>();
+                                                        resumed = await newClient.ResumeSessionAsync(
+                                                            capturedOtherState.Info.SessionId, cfg, cancellationToken);
+                                                    }
                                                     // Re-check after await — a concurrent SendPromptAsync
                                                     // may have started processing while we were resuming.
                                                     // Orphan the just-resumed session rather than cancel a live turn.
@@ -3420,6 +3470,25 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             throw;
                         }
                     }
+                    catch (Exception resumeEx) when (
+                        resumeEx.Message.Contains("tool name clash", StringComparison.OrdinalIgnoreCase) ||
+                        resumeEx.Message.Contains("already registered", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // A stale connection still holds the external tool registration on the server.
+                        // Retry without external tools — the session will work, just without show_image
+                        // until the next clean reconnect re-registers it.
+                        Debug($"[RECONNECT] '{sessionName}' tool name clash on resume, retrying without external tools: {resumeEx.Message}");
+                        reconnectConfig.Tools = new List<Microsoft.Extensions.AI.AIFunction>();
+                        newSession = await client.ResumeSessionAsync(state.Info.SessionId, reconnectConfig, cancellationToken);
+                        var actualId = newSession.SessionId;
+                        if (!string.IsNullOrEmpty(actualId) && actualId != state.Info.SessionId)
+                        {
+                            Debug($"[RECONNECT] Session ID changed on resume: '{state.Info.SessionId}' → '{actualId}' for '{sessionName}'");
+                            CopyEventsToNewSession(state.Info.SessionId, actualId);
+                            state.Info.SessionId = actualId;
+                            FlushSaveActiveSessionsToDisk();
+                        }
+                    }
                     // CRITICAL: Mark the old state as orphaned FIRST — any already-queued
                     // timer/watchdog callbacks that check IsOrphaned will bail out.
                     // Then cancel the timers to prevent new callbacks from being scheduled.
@@ -3445,10 +3514,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         Info = state.Info
                     };
                     newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    // Carry forward ProcessingGeneration so stale callbacks on the
-                    // orphaned old state can't pass generation checks on the new state.
-                    Interlocked.Exchange(ref newState.ProcessingGeneration,
-                        Interlocked.Read(ref state.ProcessingGeneration));
+                    // Reset ProcessingGeneration to 0 instead of copying from old state.
+                    // The old state already has long.MaxValue (set above) which invalidates
+                    // all stale callbacks. Copying long.MaxValue and then incrementing (line 3506)
+                    // wraps to long.MinValue, corrupting the generation counter.
+                    Interlocked.Exchange(ref newState.ProcessingGeneration, 0);
                     // Reset tool tracking for the NEW connection. The old connection's
                     // tool state is stale — no tools have run on this connection yet.
                     // Without this, HasUsedToolsThisTurn=true from the dead connection
@@ -3507,6 +3577,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // (Case D) works correctly after reconnect. The stale snapshot from the
                     // failed primary send is no longer valid.
                     state.WatchdogAbortAttempted = false;
+                    state.WatchdogKilledThisTurn = false;
                     try
                     {
                         var sid = state.Info.SessionId;
@@ -3654,6 +3725,73 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (skillDirs != null)
             Debug($"[FRESH-CONFIG] Includes {skillDirs.Count} skill dir(s)");
         return config;
+    }
+
+    /// <summary>
+    /// Force-create a fresh SDK session when the event stream is dead.
+    /// Called after detecting repeated watchdog kills with 0 events (the server-side session
+    /// is unrecoverable via ResumeSessionAsync). Creates a brand-new session ID so the
+    /// next SendPromptAsync gets a clean event stream.
+    /// </summary>
+    internal async Task<bool> TryRecoverWithFreshSessionAsync(string sessionName, CancellationToken ct)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state))
+            return false;
+
+        Debug($"[DEAD-CONN] '{sessionName}' creating fresh session (old session event stream is dead)");
+
+        try
+        {
+            if (_client == null)
+            {
+                Debug($"[DEAD-CONN] '{sessionName}' no client available — cannot recover");
+                return false;
+            }
+
+            var freshConfig = BuildFreshSessionConfig(state);
+            CopilotSession newSession;
+            try
+            {
+                newSession = await _client.CreateSessionAsync(freshConfig, ct);
+            }
+            catch (Exception createEx)
+            {
+                Debug($"[DEAD-CONN] '{sessionName}' fresh session creation failed: {createEx.Message}");
+                return false;
+            }
+
+            // Orphan the old state
+            state.IsOrphaned = true;
+            Interlocked.Exchange(ref state.ProcessingGeneration, long.MaxValue);
+            CancelProcessingWatchdog(state);
+            CancelTurnEndFallback(state);
+            CancelToolHealthCheck(state);
+            state.ResponseCompletion?.TrySetCanceled();
+
+            // Create new state with fresh session
+            var newState = new SessionState
+            {
+                Session = newSession,
+                Info = state.Info
+            };
+            newState.Info.SessionId = newSession.SessionId;
+            newState.Info.IsProcessing = false;
+            newState.Info.ProcessingStartedAt = null;
+            newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            newState.IsMultiAgentSession = state.IsMultiAgentSession;
+            DisposePrematureIdleSignal(state);
+            newSession.On(evt => HandleSessionEvent(newState, evt));
+            _sessions[sessionName] = newState;
+
+            FlushSaveActiveSessionsToDisk();
+            Debug($"[DEAD-CONN] '{sessionName}' fresh session created: {newSession.SessionId}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug($"[DEAD-CONN] '{sessionName}' recovery failed: {ex.Message}");
+            return false;
+        }
     }
 
     public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
@@ -4160,7 +4298,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Info = state.Info
             };
             newState.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-            Interlocked.Exchange(ref newState.ProcessingGeneration, Interlocked.Read(ref state.ProcessingGeneration));
+            // Reset to 0 — old state is orphaned (IsOrphaned=true) so stale callbacks
+            // bail out via the orphan guard. Copying old gen risks overflow if it was long.MaxValue.
+            Interlocked.Exchange(ref newState.ProcessingGeneration, 0);
             newState.IsMultiAgentSession = state.IsMultiAgentSession;
 
             // Register event handler BEFORE publishing to the dictionary (INV-16) so no

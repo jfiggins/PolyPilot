@@ -1102,7 +1102,7 @@
                         var result = {};
                         var active = document.activeElement;
                         document.querySelectorAll('.card-input input, .card-input textarea, .expanded-card .input-area textarea').forEach(function(el) {
-                            if (el.id && el.value) result[el.id] = el.value;
+                            if (el.id) result[el.id] = el.value || '';
                         });
                         if (active && active.id) result['__focused'] = active.id;
                         if (active) { result['__selStart'] = active.selectionStart || 0; result['__selEnd'] = active.selectionEnd || 0; }
@@ -1120,6 +1120,8 @@
                             var sessionName = id.Replace("input-", "").Replace("-", " ");
                             if (!string.IsNullOrEmpty(val))
                                 draftBySession[sessionName] = val;
+                            else
+                                draftBySession.Remove(sessionName);
                         }
                         if (saved.TryGetValue("__focused", out var fid))
                             _focusedInputId = fid;
@@ -1352,16 +1354,12 @@
 
     private void HandleReasoningReceived(string sessionName, string reasoningId, string content)
     {
-        if (!string.IsNullOrEmpty(sessionName) && !string.IsNullOrEmpty(content))
-            _needsScrollToBottom = true;
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
     }
 
     private void HandleReasoningComplete(string sessionName, string reasoningId)
     {
-        if (!string.IsNullOrEmpty(sessionName) && !string.IsNullOrEmpty(reasoningId))
-            _needsScrollToBottom = true;
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
     }
@@ -1542,17 +1540,31 @@
             var orchGroupId = CopilotService.GetOrchestratorGroupId(sessionName);
             if (orchGroupId != null)
             {
-                CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
                 List<string>? queueImagePaths = null;
                 if (hasImages)
                 {
                     queueImagePaths = pendingSendImages!.Select(i => i.TempPath).ToList();
                     pendingImagesBySession.Remove(sessionName);
                 }
-                CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
-                // Show user feedback that message is queued (orchestrator is busy dispatching workers)
-                session.History.Add(ChatMessage.SystemMessage(
-                    "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+
+                // Always show the user's message in the chat window
+                session.History.Add(ChatMessage.UserMessage(finalPrompt));
+
+                // Try routing directly into the active reflect loop (bypasses dispatch lock).
+                // Fall back to MessageQueue if no reflect loop is running.
+                if (queueImagePaths is null or { Count: 0 } && CopilotService.TryQueueForActiveReflectLoop(sessionName, finalPrompt))
+                {
+                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_REFLECT_LOOP", null, null, null, true);
+                    session.History.Add(ChatMessage.SystemMessage(
+                        "📋 Orchestrator is busy — your message will be processed at the next iteration."));
+                }
+                else
+                {
+                    CopilotService.LogDispatchRoute(sessionName, true, "QUEUED_ORCH_BUSY", null, null, null, true);
+                    CopilotService.EnqueueMessage(sessionName, finalPrompt, queueImagePaths, agentMode);
+                    session.History.Add(ChatMessage.SystemMessage(
+                        "📋 Orchestrator is busy coordinating workers — your message has been queued and will be sent when the current operation completes."));
+                }
                 session.MessageCount = session.History.Count;
                 _needsScrollToBottom = true;
                 await InvokeAsync(SafeRefreshAsync);
@@ -1585,9 +1597,10 @@
         streamingBySession.Remove(sessionName);
         activityBySession.Remove(sessionName);
 
-        // Force scroll to bottom immediately after sending
+        // Force scroll to bottom immediately after sending and reset scroll tracking
         await JS.InvokeVoidAsync("eval", @"
             document.querySelectorAll('.card-messages, .messages').forEach(function(el) {
+                el.__userScrolledAway = false;
                 el.scrollTop = el.scrollHeight;
             });
             setTimeout(function() {

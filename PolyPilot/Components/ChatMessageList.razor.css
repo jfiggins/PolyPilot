@@ -147,8 +147,99 @@
     color: rgba(255, 255, 255, 0.55);
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 300px;
+    max-height: 400px;
     overflow-y: auto;
+}
+
+::deep .orchestration-boilerplate-section {
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+::deep .orchestration-boilerplate-section:last-child {
+    border-bottom: none;
+}
+
+::deep .worker-dispatch-details {
+    margin: 0.5rem 0;
+    font-size: var(--type-callout);
+    border: 1px solid rgba(0, 195, 91, 0.15);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+::deep .worker-dispatch-details summary {
+    cursor: pointer;
+    padding: 0.4rem 0.75rem;
+    background: rgba(0, 195, 91, 0.06);
+    color: rgba(255, 255, 255, 0.65);
+    font-size: var(--type-callout);
+    user-select: none;
+}
+
+::deep .worker-dispatch-details summary:hover {
+    background: rgba(0, 195, 91, 0.1);
+    color: rgba(255, 255, 255, 0.85);
+}
+
+::deep .worker-dispatch-details .worker-dispatch-content {
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 255, 255, 0.02);
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.55);
+    max-height: 400px;
+    overflow-y: auto;
+    word-break: break-word;
+}
+
+::deep .orchestrator-dynamic-section {
+    margin: 0.5rem 0;
+    padding: 0.5rem 0.75rem;
+    background: rgba(0, 150, 255, 0.06);
+    border: 1px solid rgba(0, 150, 255, 0.15);
+    border-radius: 6px;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+::deep .orchestrator-dynamic-section .orchestrator-section-header {
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+::deep .orchestrator-dynamic-section p {
+    margin: 0.2rem 0;
+}
+
+/* Collapsible dynamic sections (e.g., Worker Results) — starts open */
+::deep .orchestrator-dynamic-details {
+    margin: 0.5rem 0;
+    background: rgba(0, 150, 255, 0.06);
+    border: 1px solid rgba(0, 150, 255, 0.15);
+    border-radius: 6px;
+    font-size: var(--type-callout);
+    color: rgba(255, 255, 255, 0.75);
+}
+
+::deep .orchestrator-dynamic-details > summary.orchestrator-section-header {
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0.5rem 0.75rem;
+    color: rgba(255, 255, 255, 0.85);
+    user-select: none;
+}
+
+::deep .orchestrator-dynamic-details > summary.orchestrator-section-header:hover {
+    color: rgba(255, 255, 255, 1);
+}
+
+::deep .orchestrator-dynamic-details .orchestrator-dynamic-content {
+    padding: 0 0.75rem 0.5rem;
+}
+
+::deep .orchestrator-dynamic-details p {
+    margin: 0.2rem 0;
 }
 
 .chat-message-list.full ::deep .chat-msg.assistant .chat-msg-content {

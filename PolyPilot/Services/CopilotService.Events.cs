@@ -641,8 +641,27 @@ public partial class CopilotService
                 // KEY FIX: Check if the server reports active background tasks (sub-agents, shells).
                 // session.idle with background tasks means "foreground quiesced, background still running."
                 // Do NOT treat this as terminal — flush text and wait for the real idle.
+                // BUT: enforce a maximum deferral time to prevent orchestrator hangs when the
+                // SDK never sends a clean idle after background tasks finish (observed in multi-agent groups).
                 if (HasActiveBackgroundTasks(idle))
                 {
+                    // Track when we first started deferring
+                    var firstDefer = Interlocked.Read(ref state.FirstIdleDeferAtTicks);
+                    if (firstDefer == 0)
+                        Interlocked.CompareExchange(ref state.FirstIdleDeferAtTicks, DateTime.UtcNow.Ticks, 0);
+                    else
+                    {
+                        var deferredSeconds = (DateTime.UtcNow - new DateTime(firstDefer)).TotalSeconds;
+                        if (deferredSeconds >= BackgroundTaskIdleMaxDeferSeconds)
+                        {
+                            Debug($"[IDLE-DEFER-FORCE] '{sessionName}' background tasks deferred for {deferredSeconds:F0}s " +
+                                  $"(max={BackgroundTaskIdleMaxDeferSeconds}s) — force-completing to prevent orchestrator hang");
+                            Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
+                            CancelIdleDeferFallback(state);
+                            goto forceComplete;
+                        }
+                    }
+
                     Debug($"[IDLE-DEFER] '{sessionName}' session.idle received with active background tasks — " +
                           $"deferring completion (IsProcessing={state.Info.IsProcessing}, " +
                           $"response={state.CurrentResponse.Length}+{state.FlushedResponse.Length} chars)");
@@ -653,9 +672,19 @@ public partial class CopilotService
                         FlushCurrentResponse(state);
                         NotifyStateChangedCoalesced();
                     });
+                    // Start a one-shot fallback timer: if no second idle arrives within
+                    // BackgroundTaskIdleMaxDeferSeconds, force-complete the session.
+                    // This prevents indefinite hangs when the SDK finishes background tasks
+                    // but never sends a clean session.idle (observed March 22 reviewer stall).
+                    StartIdleDeferFallback(state, sessionName);
                     break; // Don't complete — wait for next idle without background tasks
                 }
 
+                // Normal idle (no background tasks) — clear the deferral tracker and cancel fallback
+                Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
+                CancelIdleDeferFallback(state);
+
+                forceComplete:
                 try { CompleteReasoningMessages(state, sessionName); }
                 catch (Exception ex)
                 {
@@ -779,6 +808,7 @@ public partial class CopilotService
                 CancelProcessingWatchdog(state);
                 CancelTurnEndFallback(state);
                 CancelToolHealthCheck(state);
+                CancelIdleDeferFallback(state);
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
@@ -961,8 +991,11 @@ public partial class CopilotService
                 // Build the full response the same way CompleteResponse does
                 var remaining = state.CurrentResponse.ToString();
                 var fullResponse = string.IsNullOrEmpty(remaining) ? flushed : flushed + "\n\n" + remaining;
-                state.FlushedResponse.Clear();
-                state.CurrentResponse.Clear();
+                // Do NOT clear FlushedResponse/CurrentResponse — the orchestrator may emit
+                // more @worker blocks in subsequent tool rounds. Clearing would lose them
+                // and CompleteResponse would write incomplete content to history.
+                // FlushedResponse keeps accumulating; CompleteResponse uses it for the
+                // history message (TCS TrySetResult is a no-op since we already resolved it).
                 state.ResponseCompletion.TrySetResult(fullResponse);
             }
         }
@@ -1025,7 +1058,9 @@ public partial class CopilotService
         // Also cancel any pending TurnEnd→Idle fallback — CompleteResponse is now executing
         CancelTurnEndFallback(state);
         CancelToolHealthCheck(state);
+        CancelIdleDeferFallback(state);
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
+        Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
         state.HasUsedToolsThisTurn = false;
         state.IsReconnectedSend = false; // Clear reconnect flag on turn completion (defense-in-depth)
         state.FallbackCanceledByTurnStart = false;
@@ -1580,6 +1615,10 @@ public partial class CopilotService
     /// sibling re-resume). Shorter than the normal 120s so the reconnect triggers sooner and the user
     /// gets a second retry attempt, rather than waiting the full 2 minutes for the watchdog kill.</summary>
     internal const int WatchdogReconnectInactivityTimeoutSeconds = 35;
+    /// <summary>Maximum time in seconds to defer session completion for active background tasks.
+    /// If background tasks keep the session alive beyond this limit, force-complete anyway.
+    /// Prevents orchestrator hangs when the SDK never sends a final idle without background tasks.</summary>
+    internal const int BackgroundTaskIdleMaxDeferSeconds = 300; // 5 minutes
     /// <summary>Absolute maximum processing time in seconds. Even if events keep arriving,
     /// no single turn should run longer than this. This is a safety net for scenarios where
     /// non-progress events (like repeated SessionUsageInfoEvent) keep arriving without a terminal event.</summary>
@@ -1673,6 +1712,54 @@ public partial class CopilotService
     {
         var prev = Interlocked.Exchange(ref state.ToolHealthCheckTimer, null);
         prev?.Dispose();
+    }
+
+    private static void CancelIdleDeferFallback(SessionState state)
+    {
+        var prev = Interlocked.Exchange(ref state.IdleDeferFallbackTimer, null);
+        prev?.Dispose();
+    }
+
+    /// <summary>
+    /// Starts a one-shot timer to force-complete a session after BackgroundTaskIdleMaxDeferSeconds
+    /// when IDLE-DEFER fires and no second session.idle arrives. Without this timer, the session
+    /// hangs indefinitely if the SDK finishes background tasks but never sends a clean idle.
+    /// Only one timer runs per session — repeated IDLE-DEFER calls are no-ops if already armed.
+    /// </summary>
+    private void StartIdleDeferFallback(SessionState state, string sessionName)
+    {
+        if (state.IdleDeferFallbackTimer != null) return; // Already armed
+
+        var generation = Interlocked.Read(ref state.ProcessingGeneration);
+        var timer = new Timer(_ =>
+        {
+            if (state.IsOrphaned) return;
+            if (!state.Info.IsProcessing) return;
+            var currentGen = Interlocked.Read(ref state.ProcessingGeneration);
+            if (currentGen != generation) return; // New turn started — don't force-complete stale turn
+
+            Debug($"[IDLE-DEFER-TIMEOUT] '{sessionName}' no second session.idle received after {BackgroundTaskIdleMaxDeferSeconds}s — " +
+                  $"force-completing to unblock orchestrator (gen={generation})");
+            Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
+            CancelIdleDeferFallback(state);
+
+            InvokeOnUI(() =>
+            {
+                if (state.IsOrphaned) return;
+                if (!state.Info.IsProcessing) return;
+                var gen = Interlocked.Read(ref state.ProcessingGeneration);
+                if (gen != generation) return;
+
+                try { CompleteReasoningMessages(state, sessionName); }
+                catch (Exception ex) { Debug($"[IDLE-DEFER-TIMEOUT] '{sessionName}' CompleteReasoningMessages threw: {ex.Message}"); }
+                Debug($"[IDLE-DEFER-TIMEOUT] '{sessionName}' CompleteResponse dispatched (gen={generation})");
+                CompleteResponse(state, generation);
+            });
+        }, null, BackgroundTaskIdleMaxDeferSeconds * 1000, Timeout.Infinite);
+
+        // Atomic swap — if another thread already set it, dispose ours
+        if (Interlocked.CompareExchange(ref state.IdleDeferFallbackTimer, timer, null) != null)
+            timer.Dispose();
     }
 
     /// <summary>
@@ -2354,6 +2441,7 @@ public partial class CopilotService
                         Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
                         // Cancel any pending TurnEnd→Idle fallback
                         CancelTurnEndFallback(state);
+                        CancelIdleDeferFallback(state);
                         state.Info.IsResumed = false;
                         state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on termination
                         // Flush any accumulated partial response before clearing processing state.
@@ -2362,6 +2450,7 @@ public partial class CopilotService
                         try { FlushCurrentResponse(state); }
                         catch (Exception flushEx) { Debug($"[WATCHDOG] '{sessionName}' flush failed during kill: {flushEx.Message}"); }
                         Debug($"[WATCHDOG] '{sessionName}' IsProcessing=false — watchdog timeout after {totalProcessingSeconds:F0}s total, elapsed={elapsed:F0}s, exceededMaxTime={exceededMaxTime}");
+                        state.WatchdogKilledThisTurn = true;
                         state.Info.IsProcessing = false;
                         Interlocked.Exchange(ref state.SendingFlag, 0);
                         if (state.Info.ProcessingStartedAt is { } wdStarted)

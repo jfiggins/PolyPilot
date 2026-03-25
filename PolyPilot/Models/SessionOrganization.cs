@@ -73,6 +73,12 @@ public class SessionGroup
     /// <summary>When true, this group operates as a multi-agent orchestration group.</summary>
     public bool IsMultiAgent { get; set; }
 
+    /// <summary>
+    /// Name of the preset this group was created from, if any.
+    /// Used to refresh group settings when the preset is updated.
+    /// </summary>
+    public string? SourcePresetName { get; set; }
+
     /// <summary>The orchestration mode for multi-agent groups.</summary>
     public MultiAgentMode OrchestratorMode { get; set; } = MultiAgentMode.Broadcast;
 
@@ -248,7 +254,10 @@ public enum WorktreeStrategy
     /// <summary>Orchestrator gets its own worktree; all workers share a separate one.</summary>
     OrchestratorIsolated,
     /// <summary>Every session (orchestrator + each worker) gets its own worktree.</summary>
-    FullyIsolated
+    FullyIsolated,
+    /// <summary>Only workers flagged in GroupPreset.WorkerUseWorktree get their own worktree;
+    /// others share the orchestrator's worktree.</summary>
+    SelectiveIsolated
 }
 
 /// <summary>Role of a session within a multi-agent group.</summary>

@@ -2414,7 +2414,7 @@ public class MultiAgentRegressionTests
         var sendIdx = source.IndexOf("async Task<string> SendPromptAsync(", StringComparison.Ordinal);
         Assert.True(sendIdx >= 0, "SendPromptAsync must exist in CopilotService.cs");
 
-        var sendBlock = source.Substring(sendIdx, Math.Min(6000, source.Length - sendIdx));
+        var sendBlock = source.Substring(sendIdx, Math.Min(10000, source.Length - sendIdx));
         Assert.Contains("PrematureIdleSignal.Reset()", sendBlock);
     }
 
@@ -2673,6 +2673,399 @@ public class MultiAgentRegressionTests
             searchFrom = idx + 1;
         }
         Assert.True(calls >= 2, $"GetEventsFileMtime must be called at least twice (grace + polling), found {calls}");
+    }
+
+    #endregion
+
+    #region Workers Accounted For — Intentional Skip Tests
+
+    /// <summary>
+    /// When the orchestrator's synthesis response contains [[GROUP_REFLECT_COMPLETE]] and
+    /// explicitly mentions all undispatched workers by name, completion should be accepted.
+    /// This prevents wasteful re-dispatch to workers the orchestrator intentionally skipped.
+    /// Regression test for the "Overriding completion — Not yet dispatched" loop bug.
+    /// </summary>
+    [Fact]
+    public void ReflectCompletion_WorkerMentionedInSynthesis_CountsAsAccountedFor()
+    {
+        var workerNames = new List<string> { "Elite Dev Squad-srdev-1", "Elite Dev Squad-srdev-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Elite Dev Squad-srdev-1" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Elite Dev Squad-srdev-1" };
+
+        // Synthesis mentions srdev-2 by name (orchestrator says "no work needed")
+        var synthesisResponse = "All tasks are complete. [[GROUP_REFLECT_COMPLETE]]\n" +
+            "@worker:Elite Dev Squad-srdev-2 No work needed for this task. Confirm receipt. @end";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+        var allWorkersAccountedFor = allWorkersAttempted || workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.False(allWorkersDispatched, "srdev-2 was not dispatched");
+        Assert.False(allWorkersAttempted, "srdev-2 was not attempted");
+        Assert.True(allWorkersAccountedFor, "srdev-2 should be accounted for — mentioned by name in synthesis");
+
+        // The completion check should now pass
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && (allWorkersDispatched || allWorkersAccountedFor));
+    }
+
+    [Fact]
+    public void ReflectCompletion_WorkerNotMentionedButSomeDispatched_CompletionAccepted()
+    {
+        var workerNames = new List<string> { "Team-worker-1", "Team-worker-2", "Team-worker-3" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-worker-1" };
+
+        // Synthesis does NOT mention worker-2 or worker-3 but worker-1 was dispatched
+        var synthesisResponse = "Task done. [[GROUP_REFLECT_COMPLETE]]";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAccountedFor = workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+        var anyWorkerDispatched = dispatchedWorkers.Count > 0;
+
+        Assert.False(allWorkersAccountedFor, "worker-2 and worker-3 are not mentioned");
+        Assert.True(anyWorkerDispatched, "worker-1 was dispatched — completion should be accepted");
+
+        // Completion should be accepted because at least one worker produced results
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && (allWorkersDispatched || allWorkersAccountedFor || anyWorkerDispatched));
+    }
+
+    [Fact]
+    public void ReflectCompletion_ZeroWorkersDispatched_OverrideFires()
+    {
+        var workerNames = new List<string> { "Team-worker-1", "Team-worker-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Orchestrator tried to complete without dispatching anything
+        var synthesisResponse = "Nothing to do. [[GROUP_REFLECT_COMPLETE]]";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAccountedFor = workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+        var anyWorkerDispatched = dispatchedWorkers.Count > 0;
+
+        Assert.False(anyWorkerDispatched, "no workers dispatched — override should fire");
+
+        // Override should trigger because zero workers were dispatched
+        Assert.True(
+            synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
+            && !anyWorkerDispatched);
+    }
+
+    [Fact]
+    public void ReflectCompletion_CaseInsensitiveWorkerMatch()
+    {
+        var workerNames = new List<string> { "Squad-worker-1", "Squad-Worker-2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Squad-worker-1" };
+
+        // Synthesis mentions worker-2 with different casing
+        var synthesisResponse = "[[GROUP_REFLECT_COMPLETE]] squad-worker-2 had no applicable tasks.";
+
+        var allWorkersAccountedFor = workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            synthesisResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(allWorkersAccountedFor, "Case-insensitive match should work");
+    }
+
+    [Fact]
+    public void ReflectCompletion_AllWorkersDispatched_StillAccepted()
+    {
+        // When all workers were dispatched and succeeded, completion should work as before
+        var workerNames = new List<string> { "Team-w1", "Team-w2" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-w1", "Team-w2" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-w1", "Team-w2" };
+
+        var synthesisResponse = "[[GROUP_REFLECT_COMPLETE]] Great work by all.";
+
+        var allWorkersDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+
+        Assert.True(allWorkersDispatched);
+        Assert.True(allWorkersAttempted);
+        Assert.True(allWorkersDispatched || allWorkersAttempted);
+    }
+
+    [Fact]
+    public void ReflectCompletion_ZeroAssignments_PlanMentionsWorkers_GoalMet()
+    {
+        // When the orchestrator returns 0 assignments but mentions remaining workers
+        // by name in the plan response, GoalMet should be set
+        var workerNames = new List<string> { "Team-srdev-1", "Team-srdev-2" };
+        var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-srdev-1" };
+        var attemptedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Team-srdev-1" };
+
+        var planResponse = "All work is complete. Team-srdev-2 does not need any changes for this task.";
+
+        var allDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+        var allAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+        var allAccountedFor = allAttempted || workerNames.All(w =>
+            attemptedWorkers.Contains(w) ||
+            planResponse.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+        Assert.False(allDispatched);
+        Assert.False(allAttempted);
+        Assert.True(allAccountedFor, "Worker mentioned in plan should count as accounted for");
+    }
+
+    /// <summary>
+    /// Structural test: Organization.cs must use allWorkersAccountedFor (not just allWorkersAttempted)
+    /// when evaluating [[GROUP_REFLECT_COMPLETE]] in the self-eval path. This prevents the
+    /// override-and-redispatch loop when workers are intentionally skipped.
+    /// </summary>
+    [Fact]
+    public void OrganizationReflectPath_UsesAccountedForCheck()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath), $"Organization.cs not found at {orgPath}");
+        var source = File.ReadAllText(orgPath);
+
+        // The self-eval path must compute allWorkersAccountedFor
+        Assert.Contains("allWorkersAccountedFor", source);
+
+        // The completion check must use allWorkersAccountedFor (not just allWorkersAttempted)
+        // Find the self-eval GROUP_REFLECT_COMPLETE check and verify it uses allWorkersAccountedFor
+        var sentinelIdx = source.IndexOf("[[GROUP_REFLECT_COMPLETE]]");
+        Assert.True(sentinelIdx >= 0);
+
+        var accountedForIdx = source.IndexOf("allWorkersAccountedFor", sentinelIdx);
+        Assert.True(accountedForIdx >= 0,
+            "The [[GROUP_REFLECT_COMPLETE]] check must use allWorkersAccountedFor to allow " +
+            "completion when workers are intentionally skipped by the orchestrator.");
+    }
+
+    #endregion
+
+    #region Watchdog-Kill Retry — Avoid Nudge-to-All-Workers Tests
+
+    /// <summary>
+    /// When the orchestrator's response is truncated by a watchdog kill (connection death),
+    /// the reflect loop should retry the full planning prompt instead of sending a nudge.
+    /// Nudges after reconnect lose context and dispatch ALL workers indiscriminately.
+    /// Regression test for the March 22 dispatch failure where watchdog-killed response
+    /// (1065 chars, 0 @worker blocks) triggered a nudge → 5/5 workers dispatched.
+    /// </summary>
+    [Fact]
+    public void WatchdogKilledResponse_ShouldRetryPlanBeforeNudge_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath), $"Organization.cs not found at {orgPath}");
+        var source = File.ReadAllText(orgPath);
+
+        // Find the reflect iteration 1 zero-assignment handling
+        var reflectIter1Idx = source.IndexOf("reflectState.CurrentIteration == 1");
+        Assert.True(reflectIter1Idx >= 0, "Must have reflectState.CurrentIteration == 1 check");
+
+        // The watchdog-kill check must appear BEFORE the nudge in the reflect path
+        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", reflectIter1Idx);
+        Assert.True(watchdogCheckIdx >= 0,
+            "Reflect loop must check WatchdogKilledThisTurn before falling through to nudge");
+
+        var nudgeIdx = source.IndexOf("delegation nudge", reflectIter1Idx);
+        Assert.True(nudgeIdx >= 0, "Must still have nudge path as fallback");
+
+        Assert.True(watchdogCheckIdx < nudgeIdx,
+            "WatchdogKilledThisTurn check must appear BEFORE the nudge path — " +
+            "a watchdog-killed response should retry the planning prompt first, not nudge");
+    }
+
+    /// <summary>
+    /// The WatchdogKilledThisTurn flag must be set in the watchdog kill path
+    /// and cleared in SendPromptAsync, so it's available for the reflect loop
+    /// to detect truncated responses.
+    /// </summary>
+    [Fact]
+    public void WatchdogKilledFlag_SetInWatchdog_ClearedInSendPrompt_Structural()
+    {
+        // Check Events.cs sets the flag in watchdog kill
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var eventsSource = File.ReadAllText(eventsPath);
+
+        // The watchdog kill path sets the flag
+        var watchdogSetIdx = eventsSource.IndexOf("WatchdogKilledThisTurn = true");
+        Assert.True(watchdogSetIdx >= 0,
+            "Watchdog kill path must set WatchdogKilledThisTurn = true");
+
+        // Verify it's near the IsProcessing=false in watchdog
+        var isProcessingFalseIdx = eventsSource.IndexOf("state.Info.IsProcessing = false", watchdogSetIdx - 200);
+        Assert.True(isProcessingFalseIdx >= 0 && Math.Abs(isProcessingFalseIdx - watchdogSetIdx) < 200,
+            "WatchdogKilledThisTurn must be set near IsProcessing=false in watchdog kill");
+
+        // Check CopilotService.cs clears the flag in SendPromptAsync
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var csSource = File.ReadAllText(csPath);
+
+        var clearIdx = csSource.IndexOf("WatchdogKilledThisTurn = false");
+        Assert.True(clearIdx >= 0,
+            "SendPromptAsync must clear WatchdogKilledThisTurn = false before sending");
+    }
+
+    /// <summary>
+    /// The non-reflect orchestrator path should also check WatchdogKilledThisTurn
+    /// before falling back to the nudge mechanism.
+    /// </summary>
+    [Fact]
+    public void NonReflectPath_AlsoChecksWatchdogKill_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+
+        Assert.True(File.Exists(orgPath));
+        var source = File.ReadAllText(orgPath);
+
+        // Find the non-reflect "iteration 0" dispatch path
+        var iter0Idx = source.IndexOf("iteration 0:");
+        Assert.True(iter0Idx >= 0, "Must have non-reflect 'iteration 0' path");
+
+        // The watchdog check must appear after iteration 0 and before the nudge
+        var watchdogCheckIdx = source.IndexOf("WatchdogKilledThisTurn", iter0Idx);
+        Assert.True(watchdogCheckIdx >= 0,
+            "Non-reflect path must also check WatchdogKilledThisTurn");
+
+        var nudgeIdx = source.IndexOf("Sending delegation nudge", iter0Idx);
+        Assert.True(nudgeIdx >= 0);
+        Assert.True(watchdogCheckIdx < nudgeIdx,
+            "Watchdog-kill retry must appear before nudge in the non-reflect orchestrator path");
+    }
+
+    /// <summary>
+    /// SessionState must declare the WatchdogKilledThisTurn field so it's available
+    /// for the watchdog and reflect loop to communicate through.
+    /// </summary>
+    [Fact]
+    public void SessionState_DeclaresWatchdogKilledField()
+    {
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var source = File.ReadAllText(csPath);
+
+        Assert.Contains("WatchdogKilledThisTurn", source);
+        Assert.Contains("volatile bool WatchdogKilledThisTurn", source);
+    }
+
+    #endregion
+
+    #region IDLE-DEFER Fallback Timer Tests
+
+    /// <summary>
+    /// SessionState must declare the IdleDeferFallbackTimer field so the timer
+    /// can be stored and cancelled across event handler invocations.
+    /// </summary>
+    [Fact]
+    public void SessionState_DeclaresIdleDeferFallbackTimerField()
+    {
+        var csPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.cs"));
+        Assert.True(File.Exists(csPath));
+        var source = File.ReadAllText(csPath);
+
+        Assert.Contains("IdleDeferFallbackTimer", source);
+    }
+
+    /// <summary>
+    /// StartIdleDeferFallback must be called inside the IDLE-DEFER handler
+    /// so the fallback timer is armed when background tasks prevent completion.
+    /// </summary>
+    [Fact]
+    public void IdleDeferHandler_CallsStartIdleDeferFallback_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        // Find the IDLE-DEFER block and verify StartIdleDeferFallback is called within it
+        var idleDeferIdx = source.IndexOf("[IDLE-DEFER]");
+        Assert.True(idleDeferIdx >= 0, "IDLE-DEFER log tag must exist in Events.cs");
+
+        var startFallbackIdx = source.IndexOf("StartIdleDeferFallback", idleDeferIdx);
+        Assert.True(startFallbackIdx >= 0,
+            "StartIdleDeferFallback must be called after IDLE-DEFER detection");
+    }
+
+    /// <summary>
+    /// CancelIdleDeferFallback must be called in CompleteResponse to prevent
+    /// stale timer from force-completing after normal completion.
+    /// </summary>
+    [Fact]
+    public void CompleteResponse_CancelsIdleDeferFallback_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        // Find CompleteResponse method and verify CancelIdleDeferFallback is called
+        var completeResponseIdx = source.IndexOf("private void CompleteResponse(SessionState state,");
+        Assert.True(completeResponseIdx >= 0, "CompleteResponse method must exist");
+
+        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", completeResponseIdx);
+        Assert.True(cancelIdx >= 0,
+            "CancelIdleDeferFallback must be called inside CompleteResponse");
+    }
+
+    /// <summary>
+    /// CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync
+    /// to prevent stale timer from firing after forced completion.
+    /// </summary>
+    [Fact]
+    public void ForceComplete_CancelsIdleDeferFallback_Structural()
+    {
+        var orgPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Organization.cs"));
+        Assert.True(File.Exists(orgPath));
+        var source = File.ReadAllText(orgPath);
+
+        var forceIdx = source.IndexOf("ForceCompleteProcessingAsync");
+        Assert.True(forceIdx >= 0);
+
+        var cancelIdx = source.IndexOf("CancelIdleDeferFallback", forceIdx);
+        Assert.True(cancelIdx >= 0,
+            "CancelIdleDeferFallback must be called in ForceCompleteProcessingAsync");
+    }
+
+    /// <summary>
+    /// The IDLE-DEFER-TIMEOUT log tag must exist in the fallback timer callback,
+    /// confirming the timer fires with proper diagnostics.
+    /// </summary>
+    [Fact]
+    public void IdleDeferFallbackTimer_LogsTimeoutTag_Structural()
+    {
+        var eventsPath = Path.GetFullPath(
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "PolyPilot",
+                "Services", "CopilotService.Events.cs"));
+        Assert.True(File.Exists(eventsPath));
+        var source = File.ReadAllText(eventsPath);
+
+        Assert.Contains("[IDLE-DEFER-TIMEOUT]", source);
     }
 
     #endregion

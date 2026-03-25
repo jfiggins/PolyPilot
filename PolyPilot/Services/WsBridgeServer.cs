@@ -17,6 +17,9 @@ public class WsBridgeServer : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _acceptTask;
     private int _bridgePort;
+    // Prevents concurrent Start() calls from each spawning a netsh UAC prompt.
+    // 0 = idle, 1 = a Start() is currently executing.
+    private int _startGuard = 0;
     private CopilotService? _copilot;
     private FiestaService? _fiestaService;
     private RepoManager? _repoManager;
@@ -45,6 +48,12 @@ public class WsBridgeServer : IDisposable
     public event Action? OnStateChanged;
 
     /// <summary>
+    /// When true, Start() binds to localhost only, skipping wildcard binding
+    /// and URL ACL registration. Used in tests to avoid UAC prompts.
+    /// </summary>
+    public bool LocalhostOnly { get; set; }
+
+    /// <summary>
     /// Start the bridge server. Now only needs the port — connects to CopilotService directly.
     /// The targetPort parameter is kept for API compat but ignored.
     /// </summary>
@@ -52,28 +61,66 @@ public class WsBridgeServer : IDisposable
     {
         if (IsRunning) return;
 
-        _bridgePort = bridgePort;
-        _cts = new CancellationTokenSource();
-
-        _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://+:{bridgePort}/");
-
+        // Guard against concurrent Start() calls (e.g., DevTunnel failure racing with
+        // StartDirectSharingIfEnabled). Without this, every concurrent caller that sees
+        // IsRunning=false while TryRegisterUrlAcl blocks for the UAC prompt will also
+        // spawn its own elevated netsh process, producing N UAC prompts for the same port.
+        // Callers that lose the race simply return — the winner will set IsRunning=true,
+        // so the next legitimate call will short-circuit at the IsRunning check above.
+        if (Interlocked.CompareExchange(ref _startGuard, 1, 0) != 0) return;
         try
         {
-            _listener.Start();
-            Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode)");
-            _acceptTask = AcceptLoopAsync(_cts.Token);
-            OnStateChanged?.Invoke();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
+            if (IsRunning) return; // Re-check now that we hold the guard.
+
+            _bridgePort = bridgePort;
+            _cts = new CancellationTokenSource();
+
+            if (!LocalhostOnly)
+            {
+                _listener = new HttpListener();
+                _listener.Prefixes.Add($"http://+:{bridgePort}/");
+
+                try
+                {
+                    _listener.Start();
+                    Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode)");
+                    _acceptTask = AcceptLoopAsync(_cts.Token);
+                    OnStateChanged?.Invoke();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
+
+                    // On Windows, wildcard binding requires a URL ACL reservation.
+                    // Attempt to register one automatically so LAN/mobile connections work.
+                    if (OperatingSystem.IsWindows() && TryRegisterUrlAcl(bridgePort))
+                    {
+                        try
+                        {
+                            _listener = new HttpListener();
+                            _listener.Prefixes.Add($"http://+:{bridgePort}/");
+                            _listener.Start();
+                            Console.WriteLine($"[WsBridge] Listening on port {bridgePort} after URL ACL registration (state-sync mode)");
+                            _acceptTask = AcceptLoopAsync(_cts.Token);
+                            OnStateChanged?.Invoke();
+                            return;
+                        }
+                        catch (Exception ex3)
+                        {
+                            Console.WriteLine($"[WsBridge] Wildcard still failed after URL ACL: {ex3.Message}");
+                        }
+                    }
+                }
+            }
+
+            // Localhost-only fallback (also used when LocalhostOnly is set)
             try
             {
                 _listener = new HttpListener();
                 _listener.Prefixes.Add($"http://localhost:{bridgePort}/");
                 _listener.Start();
-                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode)");
+                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode){(LocalhostOnly ? "" : " — LAN/mobile connections will NOT work")}");
                 _acceptTask = AcceptLoopAsync(_cts.Token);
                 OnStateChanged?.Invoke();
             }
@@ -81,6 +128,107 @@ public class WsBridgeServer : IDisposable
             {
                 Console.WriteLine($"[WsBridge] Failed to start on localhost: {ex2.Message}");
             }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _startGuard, 0);
+        }
+    }
+
+    // Track ports where ACL registration has already been attempted this session.
+    // Prevents repeated UAC prompts when Start() is called multiple times
+    // (e.g., after Stop() due to a DevTunnel failure then fallback to direct sharing).
+    // Key: port number. Value: true = registration succeeded, false = failed/skipped.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, bool> _aclAttempted = new();
+
+    /// <summary>
+    /// Attempts to register a URL ACL for the wildcard prefix on the given port.
+    /// This allows HttpListener to bind to all interfaces without running as admin.
+    /// Requires elevation — launches netsh via runas and returns true if successful.
+    /// Only ever attempts registration once per port per process lifetime to avoid
+    /// repeated UAC prompts when Start() is called multiple times.
+    /// </summary>
+    private static bool TryRegisterUrlAcl(int port)
+    {
+        // If already attempted for this port, return cached result without re-prompting.
+        if (_aclAttempted.TryGetValue(port, out var cached))
+        {
+            if (cached)
+                Console.WriteLine($"[WsBridge] URL ACL already registered for http://+:{port}/ (cached)");
+            else
+                Console.WriteLine($"[WsBridge] URL ACL registration previously failed for http://+:{port}/ — skipping retry");
+            return cached;
+        }
+
+        // Check if the ACL is already registered in the system (no elevation needed).
+        // This handles the common case where a previous app run already registered it.
+        if (IsUrlAclRegistered(port))
+        {
+            Console.WriteLine($"[WsBridge] URL ACL already present for http://+:{port}/ — no registration needed");
+            _aclAttempted[port] = true;
+            return true;
+        }
+
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"http add urlacl url=http://+:{port}/ user=Everyone",
+                Verb = "runas",
+                UseShellExecute = true,
+                CreateNoWindow = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+            };
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null)
+            {
+                _aclAttempted[port] = false;
+                return false;
+            }
+            proc.WaitForExit(10_000);
+            var success = proc.ExitCode == 0;
+            Console.WriteLine(success
+                ? $"[WsBridge] URL ACL registered for http://+:{port}/"
+                : $"[WsBridge] URL ACL registration failed (exit code {proc.ExitCode})");
+            _aclAttempted[port] = success;
+            return success;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] URL ACL registration skipped: {ex.Message}");
+            _aclAttempted[port] = false;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a URL ACL is already registered for the given port using
+    /// <c>netsh http show urlacl</c> — no elevation required.
+    /// </summary>
+    private static bool IsUrlAclRegistered(int port)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = $"http show urlacl url=http://+:{port}/",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true,
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(5_000);
+            // "netsh http show urlacl" exits 0 even when the URL isn't found,
+            // so check the output for the reserved URL entry instead.
+            return output.Contains($"+:{port}/", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -421,7 +569,7 @@ public class WsBridgeServer : IDisposable
             {
                 var active = _copilot.GetActiveSession();
                 if (active != null && active.History.Count > 0)
-                    await SendSessionHistoryToClient(clientId, ws, active.Name, 10, ct);
+                    await SendSessionHistoryToClient(clientId, ws, active.Name, CopilotService.HistoryLimitForBridge, ct);
             }
 
             // Read client commands (with fragmentation support)
@@ -555,7 +703,7 @@ public class WsBridgeServer : IDisposable
                     {
                         _copilot.SetActiveSession(switchReq.SessionName);
                         BroadcastSessionsList();
-                        await SendSessionHistoryToClient(clientId, ws, switchReq.SessionName, 10, ct);
+                        await SendSessionHistoryToClient(clientId, ws, switchReq.SessionName, CopilotService.HistoryLimitForBridge, ct);
                     }
                     break;
 

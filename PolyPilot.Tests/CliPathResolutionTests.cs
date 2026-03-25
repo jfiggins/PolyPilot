@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using GitHub.Copilot.SDK;
 using PolyPilot.Models;
+using PolyPilot.Services;
 
 namespace PolyPilot.Tests;
 
@@ -311,5 +312,114 @@ public class CliPathResolutionTests
         var rid = RuntimeInformation.RuntimeIdentifier;
         var primaryPath = Path.Combine(assemblyDir!, "runtimes", rid, "native", CopilotBinaryName);
         Assert.NotEqual(primaryPath, monoBundlePath);
+    }
+
+    [Fact]
+    public void AppContextBaseDirectory_IsNotEmpty()
+    {
+        // AppContext.BaseDirectory is the third fallback for finding the bundled copilot binary.
+        // In Release/AOT Mac Catalyst builds, Assembly.Location resolves to a .xamarin/{arch}/
+        // subdirectory rather than the MonoBundle root. AppContext.BaseDirectory always
+        // points to the MonoBundle root, making it a reliable fallback.
+        var baseDir = AppContext.BaseDirectory;
+        Assert.False(string.IsNullOrEmpty(baseDir),
+            "AppContext.BaseDirectory should never be empty — it's used as a fallback " +
+            "for finding the bundled copilot binary in AOT builds");
+    }
+
+    [Fact]
+    public void AppContextBaseDirectory_FallbackPath_IsWellFormed()
+    {
+        // Verify the AppContext.BaseDirectory fallback constructs a valid path.
+        // In a Mac Catalyst .app bundle, this would be Contents/MonoBundle/copilot.
+        var baseDir = AppContext.BaseDirectory;
+        Assert.NotNull(baseDir);
+
+        var fallbackPath = Path.Combine(baseDir, CopilotBinaryName);
+        Assert.Equal(baseDir, Path.GetDirectoryName(fallbackPath) + Path.DirectorySeparatorChar);
+        Assert.Equal(CopilotBinaryName, Path.GetFileName(fallbackPath));
+    }
+
+    [Fact]
+    public void AotBuild_AssemblyLocation_MayDifferFromBaseDir()
+    {
+        // Documents the AOT build issue: Assembly.Location can point to a different
+        // directory than AppContext.BaseDirectory. In Release/AOT Mac Catalyst builds,
+        // Assembly.Location → .xamarin/maccatalyst-arm64/GitHub.Copilot.SDK.dll
+        // AppContext.BaseDirectory → Contents/MonoBundle/
+        // The copilot binary is in MonoBundle root, so AppContext.BaseDirectory is correct.
+        var assemblyDir = Path.GetDirectoryName(typeof(CopilotClient).Assembly.Location);
+        var baseDir = AppContext.BaseDirectory;
+
+        // In test context (non-AOT), these are typically the same.
+        // In AOT builds, assemblyDir would be a .xamarin/ subdirectory.
+        // Either way, ResolveBundledCliPath should find the binary using one of the paths.
+        Assert.NotNull(assemblyDir);
+        Assert.False(string.IsNullOrEmpty(baseDir));
+    }
+
+    // ================================================================
+    // Direct CopilotService resolution tests (regression tests)
+    // ================================================================
+
+    [Fact]
+    public void ResolveBundledCliPath_ReturnsNonNull()
+    {
+        // Critical regression test: the bundled CLI binary must always be discoverable.
+        // ResolveBundledCliPath checks runtimes/{rid}/native/copilot, MonoBundle fallback,
+        // and AppContext.BaseDirectory fallback.
+        var path = CopilotService.ResolveBundledCliPath();
+
+        Assert.NotNull(path);
+        Assert.False(string.IsNullOrWhiteSpace(path),
+            "ResolveBundledCliPath() returned empty/whitespace — the bundled copilot binary was not found");
+    }
+
+    [Fact]
+    public void ResolveBundledCliPath_ReturnedPath_FileExists()
+    {
+        // The path returned by ResolveBundledCliPath must point to an actual file on disk.
+        var path = CopilotService.ResolveBundledCliPath();
+        Assert.NotNull(path);
+
+        Assert.True(File.Exists(path),
+            $"ResolveBundledCliPath() returned '{path}' but the file does not exist");
+    }
+
+    [Fact]
+    public void ResolveCopilotCliPath_BuiltIn_ReturnsNonNull()
+    {
+        // CliSourceMode.BuiltIn resolves the bundled binary first, then falls back to system.
+        var path = CopilotService.ResolveCopilotCliPath(CliSourceMode.BuiltIn);
+
+        Assert.NotNull(path);
+        Assert.False(string.IsNullOrWhiteSpace(path),
+            "ResolveCopilotCliPath(BuiltIn) should find the bundled copilot binary");
+    }
+
+    [Fact]
+    public void ResolveCopilotCliPath_System_ReturnsNonNull()
+    {
+        // CliSourceMode.System checks system paths first (homebrew, npm) then falls back
+        // to the bundled binary. Since the bundled binary exists, this should always succeed.
+        var path = CopilotService.ResolveCopilotCliPath(CliSourceMode.System);
+
+        Assert.NotNull(path);
+        Assert.False(string.IsNullOrWhiteSpace(path),
+            "ResolveCopilotCliPath(System) should find a copilot binary " +
+            "(system install or bundled fallback)");
+    }
+
+    [Fact]
+    public void GetCliSourceInfo_ReturnsBuiltInPath()
+    {
+        // GetCliSourceInfo returns a tuple with builtInPath, builtInVersion,
+        // systemPath, and systemVersion. The builtInPath must always be non-null
+        // because the SDK ships the bundled binary.
+        var info = CopilotService.GetCliSourceInfo();
+
+        Assert.NotNull(info.builtInPath);
+        Assert.False(string.IsNullOrWhiteSpace(info.builtInPath),
+            "GetCliSourceInfo().builtInPath should point to the bundled copilot binary");
     }
 }

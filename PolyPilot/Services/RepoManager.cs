@@ -726,6 +726,9 @@ public class RepoManager
             throw;
         }
 
+        // Copy seed files into the new worktree (if a reposeed folder exists for this repo)
+        ApplyRepoSeedFiles(repo.Name, worktreePath);
+
         var wt = new WorktreeInfo
         {
             Id = worktreeId,
@@ -773,6 +776,51 @@ public class RepoManager
         catch (Exception ex)
         {
             Console.WriteLine($"[RepoManager] Failed to update .gitignore: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Copies files from <c>~/.polypilot/reposeed/{repoName}/</c> into the worktree.
+    /// Matches on repo name (case-insensitive). Overwrites existing files.
+    /// This lets users supply config files (.claude/, scripts, etc.) that should
+    /// be present in every worktree created for a given repository.
+    /// </summary>
+    private static void ApplyRepoSeedFiles(string repoName, string worktreePath)
+    {
+        try
+        {
+            var seedRoot = Path.Combine(GetBaseDir(), "reposeed");
+            if (!Directory.Exists(seedRoot)) return;
+
+            // Find a matching seed folder (case-insensitive)
+            var seedDir = Directory.GetDirectories(seedRoot)
+                .FirstOrDefault(d => Path.GetFileName(d)
+                    .Equals(repoName, StringComparison.OrdinalIgnoreCase));
+            if (seedDir == null) return;
+
+            CopyDirectoryRecursive(seedDir, worktreePath);
+            Console.WriteLine($"[RepoManager] Applied reposeed files from '{seedDir}' to worktree '{worktreePath}'");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RepoManager] Failed to apply reposeed files: {ex.Message}");
+        }
+    }
+
+    private static void CopyDirectoryRecursive(string sourceDir, string destDir)
+    {
+        Directory.CreateDirectory(destDir);
+
+        foreach (var file in Directory.GetFiles(sourceDir))
+        {
+            var destFile = Path.Combine(destDir, Path.GetFileName(file));
+            File.Copy(file, destFile, overwrite: true);
+        }
+
+        foreach (var subDir in Directory.GetDirectories(sourceDir))
+        {
+            var destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
+            CopyDirectoryRecursive(subDir, destSubDir);
         }
     }
 
@@ -858,6 +906,9 @@ public class RepoManager
                 Console.WriteLine($"[RepoManager] Could not set upstream tracking: {ex.Message}");
             }
         }
+
+        // Copy seed files into the new worktree (if a reposeed folder exists for this repo)
+        ApplyRepoSeedFiles(repo.Name, worktreePath);
 
         var wt = new WorktreeInfo
         {
