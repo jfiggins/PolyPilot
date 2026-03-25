@@ -765,6 +765,14 @@
                 CopilotService.CodespacesEnabled = settings.CodespacesEnabled && settings.Mode == ConnectionMode.Embedded;
                 CopilotService.NotifyStateChanged();
                 break;
+            case "ha.enabled":
+            case "ha.url":
+            case "ha.token":
+                // HA settings don't require reconnect — push updated settings into
+                // CopilotService so the reporter picks them up immediately.
+                CopilotService.UpdateSettingsPartial(settings);
+                CopilotService.NotifyStateChanged();
+                break;
         }
         SaveSettingsQuietly();
         StateHasChanged();

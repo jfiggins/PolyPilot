@@ -393,6 +393,13 @@ public partial class CopilotService : IAsyncDisposable
     public void NotifyStateChanged() => OnStateChanged?.Invoke();
 
     /// <summary>
+    /// Updates the in-memory settings reference without triggering a reconnect.
+    /// Use when non-connection settings (e.g. Home Assistant) change at runtime.
+    /// Does not fire OnStateChanged — callers should do that explicitly if needed.
+    /// </summary>
+    public void UpdateSettingsPartial(ConnectionSettings settings) => _currentSettings = settings;
+
+    /// <summary>
     /// Coalesced state change notification. Batches rapid-fire events (tool starts,
     /// phase changes, turn starts) into a single OnStateChanged callback within the
     /// coalesce window. Use this for high-frequency, non-critical state updates.
