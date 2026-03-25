@@ -669,10 +669,7 @@
                         </div>
                     }
 
-                    @{
-                        var haReporter = ServiceProvider.GetService<HomeAssistantReporterService>();
-                    }
-                    @if (haReporter?.LastReportTime != null)
+                    @if (ServiceProvider.GetService<HomeAssistantReporterService>() is { LastReportTime: not null } haReporter)
                     {
                         <div class="ha-status-summary">
                             <div class="ha-status-row">
