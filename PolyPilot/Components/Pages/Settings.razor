@@ -605,15 +605,110 @@
     @{ var integrationSettings = SettingsRegistry.ForCategory("Integrations", settingsCtx).ToList(); }
     <div id="settings-integrations" class="settings-group @(GroupVisible("integrations") ? "" : "search-hidden")">
         <h2 class="group-title">Integrations</h2>
+
+        @* ── Home Assistant (custom section) ─────────────────────────── *@
+        @{
+            var haDesc = integrationSettings.FirstOrDefault(d => d.Id == "ha.section");
+        }
+        @if (haDesc != null && SettingMatchesSearch(haDesc))
+        {
         <div class="settings-section">
-            @foreach (var desc in integrationSettings)
-            {
-                @if (SettingMatchesSearch(desc))
+            <div class="ha-section">
+                <div class="setting-row">
+                    <div class="setting-info">
+                        <span class="setting-label">Enable Home Assistant reporting</span>
+                        <span class="setting-desc">Post PolyPilot status to Home Assistant sensors whenever state changes.</span>
+                    </div>
+                    <div class="setting-control">
+                        <label class="toggle-label">
+                            <input type="checkbox" checked="@settings.HomeAssistantEnabled" @onchange="OnHaEnabledChanged" />
+                        </label>
+                    </div>
+                </div>
+
+                @if (settings.HomeAssistantEnabled)
                 {
-                    <PolyPilot.Components.Settings.SettingEditor Descriptor="desc" Context="settingsCtx" OnChanged="OnSettingChanged" />
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <span class="setting-label">Home Assistant URL</span>
+                            <span class="setting-desc">e.g. http://homeassistant.local:8123</span>
+                        </div>
+                        <div class="setting-control">
+                            <input type="text"
+                                   class="setting-input"
+                                   value="@(settings.HomeAssistantUrl ?? "")"
+                                   placeholder="http://homeassistant.local:8123"
+                                   @onchange="OnHaUrlChanged" />
+                        </div>
+                    </div>
+
+                    <div class="setting-row">
+                        <div class="setting-info">
+                            <span class="setting-label">Long-Lived Access Token</span>
+                            <span class="setting-desc">Profile → Long-Lived Access Tokens in Home Assistant.</span>
+                        </div>
+                        <div class="setting-control">
+                            <input type="password"
+                                   class="setting-input"
+                                   value="@(settings.HomeAssistantToken ?? "")"
+                                   placeholder="Token"
+                                   @onchange="OnHaTokenChanged" />
+                        </div>
+                    </div>
+
+                    <div class="ha-actions-row">
+                        <button class="ha-test-btn" disabled="@haTestBusy" @onclick="TestHaConnection">
+                            @if (haTestBusy) { <span>Testing…</span> } else { <span>Test Connection</span> }
+                        </button>
+                    </div>
+
+                    @if (haTestResult != null)
+                    {
+                        <div class="ha-test-result @(haTestResult.StartsWith("✓") ? "ha-success" : "ha-error")">
+                            @haTestResult
+                        </div>
+                    }
+
+                    @{
+                        var haReporter = ServiceProvider.GetService<HomeAssistantReporterService>();
+                    }
+                    @if (haReporter?.LastReportTime != null)
+                    {
+                        <div class="ha-status-summary">
+                            <div class="ha-status-row">
+                                <span class="ha-status-dot @(haReporter.LastReportSuccess == true ? "ha-dot-ok" : "ha-dot-err")"></span>
+                                <span class="ha-status-text">
+                                    @if (haReporter.LastReportSuccess == true)
+                                    {
+                                        @:Last report succeeded
+                                    }
+                                    else
+                                    {
+                                        @:Last report failed@(haReporter.LastReportError != null ? $": {haReporter.LastReportError}" : "")
+                                    }
+                                </span>
+                            </div>
+                            <div class="ha-entities-list">
+                                <span class="ha-entity-badge">sensor.polypilot_status</span>
+                                <span class="ha-entity-badge">binary_sensor.polypilot_processing</span>
+                            </div>
+                        </div>
+                    }
                 }
-            }
+            </div>
         </div>
+        }
+
+        @* ── Other integration settings (non-HA) rendered generically ── *@
+        @foreach (var desc in integrationSettings.Where(d => d.Id != "ha.section"))
+        {
+            @if (SettingMatchesSearch(desc))
+            {
+                <div class="settings-section">
+                    <PolyPilot.Components.Settings.SettingEditor Descriptor="desc" Context="settingsCtx" OnChanged="OnSettingChanged" />
+                </div>
+            }
+        }
     </div>
 
     @if (!string.IsNullOrEmpty(statusMessage))
@@ -657,6 +752,8 @@
     private string? fiestaLinkError;
     private SettingsContext settingsCtx = null!;
     private List<DiscoveredPlugin> discoveredPlugins = new();
+    private bool haTestBusy;
+    private string? haTestResult;
 
     [JSInvokable]
     public void JsUpdateSearch(string query)
@@ -768,8 +865,7 @@
             case "ha.enabled":
             case "ha.url":
             case "ha.token":
-                // HA settings don't require reconnect — push updated settings into
-                // CopilotService so the reporter picks them up immediately.
+                // Handled by custom HA section methods — keep switch case for completeness.
                 CopilotService.UpdateSettingsPartial(settings);
                 CopilotService.NotifyStateChanged();
                 break;
@@ -782,6 +878,66 @@
     {
         try { settings.Save(); }
         catch { /* best-effort */ }
+    }
+
+    // ── Home Assistant setting handlers ─────────────────────────────────
+
+    private void PushHaSettings()
+    {
+        CopilotService.UpdateSettingsPartial(settings);
+        CopilotService.NotifyStateChanged();
+        SaveSettingsQuietly();
+    }
+
+    private void OnHaEnabledChanged(ChangeEventArgs e)
+    {
+        settings.HomeAssistantEnabled = e.Value is true;
+        haTestResult = null;
+        PushHaSettings();
+    }
+
+    private void OnHaUrlChanged(ChangeEventArgs e)
+    {
+        var raw = e.Value?.ToString();
+        settings.HomeAssistantUrl = ConnectionSettings.NormalizeRemoteUrl(raw);
+        haTestResult = null;
+        PushHaSettings();
+    }
+
+    private void OnHaTokenChanged(ChangeEventArgs e)
+    {
+        settings.HomeAssistantToken = e.Value?.ToString();
+        haTestResult = null;
+        PushHaSettings();
+    }
+
+    private async Task TestHaConnection()
+    {
+        haTestBusy = true;
+        haTestResult = null;
+        StateHasChanged();
+
+        try
+        {
+            var reporter = ServiceProvider.GetService<HomeAssistantReporterService>();
+            if (reporter == null)
+            {
+                haTestResult = "✗ Reporter service not available.";
+                return;
+            }
+
+            var error = await reporter.TestConnectionAsync(settings.HomeAssistantUrl, settings.HomeAssistantToken);
+            haTestResult = error == null ? "✓ Connected to Home Assistant!" : $"✗ {error}";
+        }
+        catch (Exception ex)
+        {
+            haTestResult = $"✗ {ex.Message}";
+        }
+        finally
+        {
+            haTestBusy = false;
+            StateHasChanged();
+        }
     }
 
     private void ShowStatus(string message, string cls, int dismissMs = 3000)

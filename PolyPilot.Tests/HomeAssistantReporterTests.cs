@@ -8,7 +8,8 @@ namespace PolyPilot.Tests;
 
 /// <summary>
 /// Tests for HomeAssistantReporterService — verifies HA reporting behavior
-/// including enable/disable guards, payload content, and error resilience.
+/// including enable/disable guards, payload content, binary sensor, connection
+/// status tracking, and error resilience.
 /// </summary>
 public class HomeAssistantReporterTests
 {
@@ -83,7 +84,7 @@ public class HomeAssistantReporterTests
     }
 
     [Fact]
-    public async Task Enabled_SendsPostToExpectedEndpoint()
+    public async Task Enabled_SendsPostToExpectedEndpoints()
     {
         var handler = new CapturingHandler();
         var copilot = CreateCopilotService();
@@ -96,10 +97,16 @@ public class HomeAssistantReporterTests
         copilot.NotifyStateChanged();
         await Task.Delay(800);
 
-        Assert.Single(handler.Requests);
-        var req = handler.Requests[0];
-        Assert.Equal(HttpMethod.Post, req.Method);
-        Assert.Equal("http://ha.local:8123/api/states/sensor.polypilot_status", req.Uri.ToString());
+        // Should send two entities: sensor + binary_sensor
+        Assert.Equal(2, handler.Requests.Count);
+
+        var statusReq = handler.Requests[0];
+        Assert.Equal(HttpMethod.Post, statusReq.Method);
+        Assert.Equal("http://ha.local:8123/api/states/sensor.polypilot_status", statusReq.Uri.ToString());
+
+        var processingReq = handler.Requests[1];
+        Assert.Equal(HttpMethod.Post, processingReq.Method);
+        Assert.Equal("http://ha.local:8123/api/states/binary_sensor.polypilot_processing", processingReq.Uri.ToString());
     }
 
     [Fact]
@@ -117,14 +124,14 @@ public class HomeAssistantReporterTests
         copilot.NotifyStateChanged();
         await Task.Delay(800);
 
-        Assert.Single(handler.Requests);
+        Assert.NotEmpty(handler.Requests);
         // Auth header check: inspect the captured body to ensure a request was sent
         // (bearer token validation happens inside HttpClient, not captured in body)
         Assert.NotEmpty(handler.Requests[0].Body);
     }
 
     [Fact]
-    public async Task Enabled_PayloadContainsExpectedFields()
+    public async Task Enabled_StatusPayloadContainsExpectedFields()
     {
         var handler = new CapturingHandler();
         var copilot = CreateCopilotService();
@@ -136,7 +143,7 @@ public class HomeAssistantReporterTests
         copilot.NotifyStateChanged();
         await Task.Delay(800);
 
-        Assert.Single(handler.Requests);
+        Assert.NotEmpty(handler.Requests);
         var body = handler.Requests[0].Body;
         using var doc = JsonDocument.Parse(body);
         var root = doc.RootElement;
@@ -146,9 +153,45 @@ public class HomeAssistantReporterTests
         Assert.True(attrs.TryGetProperty("session_count", out _), "attributes must have 'session_count'");
         Assert.True(attrs.TryGetProperty("processing_count", out _), "attributes must have 'processing_count'");
         Assert.True(attrs.TryGetProperty("active_session", out _), "attributes must have 'active_session'");
+        Assert.True(attrs.TryGetProperty("active_session_model", out _), "attributes must have 'active_session_model'");
+        Assert.True(attrs.TryGetProperty("active_session_input_tokens", out _), "attributes must have 'active_session_input_tokens'");
+        Assert.True(attrs.TryGetProperty("active_session_output_tokens", out _), "attributes must have 'active_session_output_tokens'");
+        Assert.True(attrs.TryGetProperty("active_session_is_processing", out _), "attributes must have 'active_session_is_processing'");
         Assert.True(attrs.TryGetProperty("is_initialized", out _), "attributes must have 'is_initialized'");
+        Assert.True(attrs.TryGetProperty("is_bridge_connected", out _), "attributes must have 'is_bridge_connected'");
+        Assert.True(attrs.TryGetProperty("github_login", out _), "attributes must have 'github_login'");
+        Assert.True(attrs.TryGetProperty("version", out _), "attributes must have 'version'");
         Assert.True(attrs.TryGetProperty("friendly_name", out var fn), "attributes must have 'friendly_name'");
         Assert.Equal("PolyPilot Status", fn.GetString());
+    }
+
+    [Fact]
+    public async Task Enabled_BinarySensorPayloadContainsExpectedFields()
+    {
+        var handler = new CapturingHandler();
+        var copilot = CreateCopilotService();
+        var settings = EnabledSettings();
+
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+        try { await copilot.ReconnectAsync(settings); } catch { }
+
+        copilot.NotifyStateChanged();
+        await Task.Delay(800);
+
+        Assert.True(handler.Requests.Count >= 2, "should have at least 2 requests (sensor + binary_sensor)");
+        var body = handler.Requests[1].Body;
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        Assert.True(root.TryGetProperty("state", out var state), "payload must have 'state'");
+        Assert.Equal("off", state.GetString()); // no sessions processing initially
+        Assert.True(root.TryGetProperty("attributes", out var attrs), "payload must have 'attributes'");
+        Assert.True(attrs.TryGetProperty("processing_count", out _), "attributes must have 'processing_count'");
+        Assert.True(attrs.TryGetProperty("processing_sessions", out _), "attributes must have 'processing_sessions'");
+        Assert.True(attrs.TryGetProperty("device_class", out var dc), "attributes must have 'device_class'");
+        Assert.Equal("running", dc.GetString());
+        Assert.True(attrs.TryGetProperty("friendly_name", out var fn), "attributes must have 'friendly_name'");
+        Assert.Equal("PolyPilot Processing", fn.GetString());
     }
 
     [Fact]
@@ -196,7 +239,7 @@ public class HomeAssistantReporterTests
     }
 
     [Fact]
-    public async Task HttpError_DoesNotPropagateException()
+    public async Task HttpError_DoesNotPropagateException_AndTracksFailure()
     {
         var handler = new CapturingHandler { ThrowException = new HttpRequestException("network error") };
         var copilot = CreateCopilotService();
@@ -205,15 +248,38 @@ public class HomeAssistantReporterTests
         await using var reporter = new HomeAssistantReporterService(copilot, handler);
         try { await copilot.ReconnectAsync(settings); } catch { }
 
+        Assert.Null(reporter.LastReportSuccess); // never attempted yet
+
         // Should not throw
         copilot.NotifyStateChanged();
         await Task.Delay(800);
 
-        // Exception was swallowed — no assertion on requests since handler threw
+        // Connection status should be tracked
+        Assert.False(reporter.LastReportSuccess);
+        Assert.NotNull(reporter.LastReportTime);
+        Assert.Contains("network error", reporter.LastReportError);
     }
 
     [Fact]
-    public async Task RapidStateChanges_OnlySendsOneRequest()
+    public async Task SuccessfulReport_TracksSuccess()
+    {
+        var handler = new CapturingHandler();
+        var copilot = CreateCopilotService();
+        var settings = EnabledSettings();
+
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+        try { await copilot.ReconnectAsync(settings); } catch { }
+
+        copilot.NotifyStateChanged();
+        await Task.Delay(800);
+
+        Assert.True(reporter.LastReportSuccess);
+        Assert.NotNull(reporter.LastReportTime);
+        Assert.Null(reporter.LastReportError);
+    }
+
+    [Fact]
+    public async Task RapidStateChanges_OnlySendsOneRoundOfRequests()
     {
         var handler = new CapturingHandler();
         var copilot = CreateCopilotService();
@@ -228,8 +294,8 @@ public class HomeAssistantReporterTests
 
         await Task.Delay(900); // wait for debounce (500ms) + HTTP
 
-        // Debounce collapses all 20 into at most 2 (one from initial batch + maybe a second)
-        Assert.InRange(handler.Requests.Count, 1, 2);
+        // Each report sends 2 requests (sensor + binary_sensor), debounce collapses 20 events into 1-2 rounds
+        Assert.InRange(handler.Requests.Count, 2, 4);
     }
 
     [Fact]
@@ -269,5 +335,71 @@ public class HomeAssistantReporterTests
         await Task.Delay(800);
 
         Assert.Equal(countBeforeDispose, handler.Requests.Count);
+    }
+
+    // ── TestConnectionAsync tests ───────────────────────────────────────────
+
+    [Fact]
+    public async Task TestConnection_MissingUrl_ReturnsError()
+    {
+        var handler = new CapturingHandler();
+        var copilot = CreateCopilotService();
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+
+        var result = await reporter.TestConnectionAsync(null, "token");
+        Assert.NotNull(result);
+        Assert.Contains("URL", result);
+    }
+
+    [Fact]
+    public async Task TestConnection_MissingToken_ReturnsError()
+    {
+        var handler = new CapturingHandler();
+        var copilot = CreateCopilotService();
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+
+        var result = await reporter.TestConnectionAsync("http://ha.local:8123", null);
+        Assert.NotNull(result);
+        Assert.Contains("token", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task TestConnection_Success_ReturnsNull()
+    {
+        var handler = new CapturingHandler { StatusCode = HttpStatusCode.OK };
+        var copilot = CreateCopilotService();
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+
+        var result = await reporter.TestConnectionAsync("http://ha.local:8123", "valid-token");
+        Assert.Null(result); // null = success
+
+        // Verify it hit GET /api/
+        Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Get, handler.Requests[0].Method);
+        Assert.Equal("http://ha.local:8123/api/", handler.Requests[0].Uri.ToString());
+    }
+
+    [Fact]
+    public async Task TestConnection_Unauthorized_ReturnsTokenError()
+    {
+        var handler = new CapturingHandler { StatusCode = HttpStatusCode.Unauthorized };
+        var copilot = CreateCopilotService();
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+
+        var result = await reporter.TestConnectionAsync("http://ha.local:8123", "bad-token");
+        Assert.NotNull(result);
+        Assert.Contains("token", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task TestConnection_NetworkError_ReturnsConnectionError()
+    {
+        var handler = new CapturingHandler { ThrowException = new HttpRequestException("refused") };
+        var copilot = CreateCopilotService();
+        await using var reporter = new HomeAssistantReporterService(copilot, handler);
+
+        var result = await reporter.TestConnectionAsync("http://ha.local:8123", "token");
+        Assert.NotNull(result);
+        Assert.Contains("Connection failed", result);
     }
 }

@@ -1514,3 +1514,111 @@
     color: var(--text-tertiary);
     font-size: var(--type-callout);
 }
+
+/* ── Home Assistant section ────────────────────────────────────────── */
+
+.ha-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.ha-actions-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0 4px 0;
+}
+
+.ha-test-btn {
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--control-border);
+    background: var(--control-bg, rgba(128,128,128,0.08));
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: var(--type-callout);
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.ha-test-btn:hover:not(:disabled) {
+    background: var(--control-bg-hover, rgba(128,128,128,0.16));
+    border-color: var(--accent-primary, #0078d4);
+}
+
+.ha-test-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.ha-test-result {
+    font-size: var(--type-callout);
+    padding: 6px 10px;
+    border-radius: 6px;
+    margin-top: 4px;
+}
+
+.ha-success {
+    color: #2ea043;
+    background: rgba(46,160,67,0.08);
+}
+
+.ha-error {
+    color: #f85149;
+    background: rgba(248,81,73,0.08);
+}
+
+.ha-status-summary {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--control-bg, rgba(128,128,128,0.06));
+    border: 1px solid var(--control-border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ha-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--type-callout);
+    color: var(--text-secondary);
+}
+
+.ha-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.ha-dot-ok {
+    background: #2ea043;
+    box-shadow: 0 0 4px rgba(46,160,67,0.4);
+}
+
+.ha-dot-err {
+    background: #f85149;
+    box-shadow: 0 0 4px rgba(248,81,73,0.4);
+}
+
+.ha-status-text {
+    flex: 1;
+}
+
+.ha-entities-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.ha-entity-badge {
+    font-family: var(--font-mono);
+    font-size: var(--type-callout);
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--control-bg-hover, rgba(128,128,128,0.12));
+    color: var(--text-secondary);
+}
