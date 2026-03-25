@@ -695,7 +695,7 @@ public class RepoManager
             // Nested strategy: place worktree inside the user's repo at .polypilot/worktrees/{branch}/
             var repoWorktreesDir = Path.Combine(Path.GetFullPath(localPath), ".polypilot", "worktrees");
             Directory.CreateDirectory(repoWorktreesDir);
-            EnsureGitIgnoreEntry(localPath, ".polypilot/");
+            EnsureGitExcludeEntry(localPath, ".polypilot/");
             worktreePath = Path.Combine(repoWorktreesDir, branchName);
 
             // Guard against path traversal: branch names with ".." or leading "/" could escape
@@ -750,32 +750,114 @@ public class RepoManager
 
     /// <summary>
     /// Ensures that <paramref name="entry"/> (e.g. <c>.polypilot/</c>) is present in the
-    /// <c>.gitignore</c> file inside <paramref name="repoPath"/>. Creates <c>.gitignore</c>
-    /// if it does not exist. No-op if the entry is already present.
+    /// <c>.git/info/exclude</c> file inside <paramref name="repoPath"/>. This is a local-only
+    /// exclusion that is never tracked by git, unlike <c>.gitignore</c>.
+    /// Creates the file if it does not exist. No-op if the entry is already present.
     /// </summary>
-    private static void EnsureGitIgnoreEntry(string repoPath, string entry)
+    private static void EnsureGitExcludeEntry(string repoPath, string entry)
     {
         try
         {
-            var gitignorePath = Path.Combine(repoPath, ".gitignore");
-            var lines = File.Exists(gitignorePath)
-                ? File.ReadAllLines(gitignorePath)
+            var dotGitPath = Path.Combine(repoPath, ".git");
+
+            // Early return if no .git file or directory exists (not a valid repo)
+            if (!Directory.Exists(dotGitPath) && !File.Exists(dotGitPath))
+                return;
+
+            var excludePath = Path.Combine(dotGitPath, "info", "exclude");
+            var infoDir = Path.GetDirectoryName(excludePath)!;
+            if (!Directory.Exists(infoDir))
+            {
+                // If .git is a file (worktree), resolve the real gitdir
+                if (File.Exists(dotGitPath))
+                {
+                    var firstLine = File.ReadLines(dotGitPath).FirstOrDefault()?.Trim();
+                    if (firstLine != null && firstLine.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var gitdir = firstLine["gitdir:".Length..].Trim();
+                        if (!Path.IsPathRooted(gitdir))
+                            gitdir = Path.GetFullPath(Path.Combine(repoPath, gitdir));
+                        var resolvedGitdir = Path.GetFullPath(gitdir);
+
+                        // Validate the resolved gitdir is within the repo or a legitimate .git/worktrees/ subtree
+                        var repoFull = Path.GetFullPath(repoPath) + Path.DirectorySeparatorChar;
+                        if (!resolvedGitdir.StartsWith(repoFull, StringComparison.Ordinal)
+                            && !resolvedGitdir.Contains(Path.Combine(".git", "worktrees"), StringComparison.Ordinal))
+                            return;
+
+                        excludePath = Path.Combine(resolvedGitdir, "info", "exclude");
+                        infoDir = Path.GetDirectoryName(excludePath)!;
+                    }
+                    else
+                    {
+                        // Malformed .git file — cannot resolve gitdir
+                        return;
+                    }
+                }
+                Directory.CreateDirectory(infoDir);
+            }
+
+            var lines = File.Exists(excludePath)
+                ? File.ReadAllLines(excludePath)
                 : [];
 
-            // Check if any existing line matches (exact or without trailing slash variant)
             var entryTrimmed = entry.TrimEnd('/');
             if (lines.Any(l => l.Trim() == entry || l.Trim() == entryTrimmed || l.Trim() == $"/{entry}" || l.Trim() == $"/{entryTrimmed}"))
                 return;
 
-            // Append with a leading newline if file doesn't end with one
-            using var sw = new StreamWriter(gitignorePath, append: true);
+            using var sw = new StreamWriter(excludePath, append: true);
             if (lines.Length > 0 && !string.IsNullOrEmpty(lines[^1]))
                 sw.WriteLine();
             sw.WriteLine(entry);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RepoManager] Failed to update .gitignore: {ex.Message}");
+            Console.WriteLine($"[RepoManager] Failed to update .git/info/exclude: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Copies files from <c>~/.polypilot/reposeed/{repoName}/</c> into the worktree.
+    /// Matches on repo name (case-insensitive). Overwrites existing files.
+    /// This lets users supply config files (.claude/, scripts, etc.) that should
+    /// be present in every worktree created for a given repository.
+    /// </summary>
+    private static void ApplyRepoSeedFiles(string repoName, string worktreePath)
+    {
+        try
+        {
+            var seedRoot = Path.Combine(GetBaseDir(), "reposeed");
+            if (!Directory.Exists(seedRoot)) return;
+
+            // Find a matching seed folder (case-insensitive)
+            var seedDir = Directory.GetDirectories(seedRoot)
+                .FirstOrDefault(d => Path.GetFileName(d)
+                    .Equals(repoName, StringComparison.OrdinalIgnoreCase));
+            if (seedDir == null) return;
+
+            CopyDirectoryRecursive(seedDir, worktreePath);
+            Console.WriteLine($"[RepoManager] Applied reposeed files from '{seedDir}' to worktree '{worktreePath}'");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RepoManager] Failed to apply reposeed files: {ex.Message}");
+        }
+    }
+
+    private static void CopyDirectoryRecursive(string sourceDir, string destDir)
+    {
+        Directory.CreateDirectory(destDir);
+
+        foreach (var file in Directory.GetFiles(sourceDir))
+        {
+            var destFile = Path.Combine(destDir, Path.GetFileName(file));
+            File.Copy(file, destFile, overwrite: true);
+        }
+
+        foreach (var subDir in Directory.GetDirectories(sourceDir))
+        {
+            var destSubDir = Path.Combine(destDir, Path.GetFileName(subDir));
+            CopyDirectoryRecursive(subDir, destSubDir);
         }
     }
 
