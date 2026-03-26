@@ -996,19 +996,46 @@ public partial class CopilotService
         // Provider groups are managed by their plugin — can't be deleted while plugin is loaded
         if (GetProviderForGroup(groupId) != null) return;
 
-        var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
-        var isMultiAgent = group?.IsMultiAgent ?? false;
+        // In remote mode, delegate to the server which owns the sessions and worktrees.
+        // The server will close sessions, clean up worktrees, remove the group, and
+        // broadcast the updated org state back to mobile.
+        if (IsRemoteMode)
+        {
+            // Remove locally first so UI updates immediately
+            var remoteGroup = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            var remoteIsMultiAgent = remoteGroup?.IsMultiAgent ?? false;
+            if (remoteIsMultiAgent || remoteGroup?.IsCodespace == true)
+            {
+                var sessionNames = Organization.Sessions.Where(m => m.GroupId == groupId).Select(m => m.SessionName).ToList();
+                RemoveSessionMetasWhere(m => sessionNames.Contains(m.SessionName));
+                foreach (var name in sessionNames)
+                    _sessions.TryRemove(name, out _);
+            }
+            else
+            {
+                foreach (var meta in Organization.Sessions.Where(m => m.GroupId == groupId))
+                    meta.GroupId = SessionGroup.DefaultId;
+            }
+            RemoveGroupsWhere(g => g.Id == groupId);
+            OnStateChanged?.Invoke();
+            // Tell server to do the real cleanup
+            _ = _bridgeClient.SendOrganizationCommandAsync(new OrganizationCommandPayload { Command = "delete_group", GroupId = groupId });
+            return;
+        }
+
+        var group2 = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+        var isMultiAgent = group2?.IsMultiAgent ?? false;
 
         // Collect all worktree IDs for cleanup before removing metadata
         var worktreeIds = new HashSet<string>();
-        if (group?.WorktreeId != null) worktreeIds.Add(group.WorktreeId);
+        if (group2?.WorktreeId != null) worktreeIds.Add(group2.WorktreeId);
         // CreatedWorktreeIds is the authoritative list (covers cases where session creation failed)
-        if (group?.CreatedWorktreeIds != null)
-            foreach (var id in group.CreatedWorktreeIds) worktreeIds.Add(id);
+        if (group2?.CreatedWorktreeIds != null)
+            foreach (var id in group2.CreatedWorktreeIds) worktreeIds.Add(id);
         foreach (var m in Organization.Sessions.Where(m => m.GroupId == groupId))
             if (m.WorktreeId != null) worktreeIds.Add(m.WorktreeId);
 
-        if (isMultiAgent || group?.IsCodespace == true)
+        if (isMultiAgent || group2?.IsCodespace == true)
         {
             // Multi-agent and codespace sessions are bound to their group — close them
             var sessionNames = Organization.Sessions
@@ -1064,7 +1091,7 @@ public partial class CopilotService
                 meta.GroupId = SessionGroup.DefaultId;
                 // Clear worktree link for repo groups so ReconcileOrganization
                 // won't reassign these sessions back to a recreated repo group
-                if (group?.RepoId != null)
+                if (group2?.RepoId != null)
                     meta.WorktreeId = null;
             }
         }
@@ -1072,8 +1099,8 @@ public partial class CopilotService
         // Track deleted repo groups so ReconcileOrganization won't resurrect them.
         // Only tombstone for regular repo groups — multi-agent groups share the same RepoId key
         // but are tracked separately, so deleting a squad must not suppress the regular sidebar group.
-        if (group?.RepoId != null && !isMultiAgent)
-            Organization.DeletedRepoGroupRepoIds.Add(group.RepoId);
+        if (group2?.RepoId != null && !isMultiAgent)
+            Organization.DeletedRepoGroupRepoIds.Add(group2.RepoId);
 
         RemoveGroupsWhere(g => g.Id == groupId);
 
@@ -1856,10 +1883,13 @@ public partial class CopilotService
 
                 if (iterAssignments.Count == 0)
                 {
-                    Debug($"[DISPATCH] No assignments after all nudges. Cannot proceed without delegation.");
-                    AddOrchestratorSystemMessage(orchestratorName, "⚠️ Failed to delegate — orchestrator did not produce any @worker assignments after multiple attempts.");
-                    InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
-                    return;
+                    // All nudges failed — use charter-based relevance matching instead
+                    // of giving up entirely.
+                    var relevant = SelectRelevantWorkers(prompt, workerNames);
+                    Debug($"[DISPATCH] All nudges failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"⚡ Orchestrator could not delegate. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
+                    iterAssignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
                 }
             }
         }
@@ -2041,6 +2071,81 @@ public partial class CopilotService
         sb.AppendLine();
         sb.AppendLine("Produce @worker blocks for the workers you need. Do NOT explain, do NOT summarize previous work, ONLY output @worker blocks.");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Selects workers most relevant to a task based on their system prompt (charter).
+    /// Used as a fallback when the orchestrator fails to delegate — instead of force-dispatching
+    /// to ALL workers (which wastes resources and confuses specialists), this picks only workers
+    /// whose charter keywords overlap with the task prompt.
+    /// </summary>
+    private List<string> SelectRelevantWorkers(string taskPrompt, List<string> workerNames, int maxWorkers = 3)
+    {
+        var promptLower = taskPrompt.ToLowerInvariant();
+        var scored = new List<(string Name, int Score)>();
+
+        foreach (var worker in workerNames)
+        {
+            var meta = GetSessionMeta(worker);
+            var charter = meta?.SystemPrompt;
+            int score = 0;
+
+            if (!string.IsNullOrEmpty(charter))
+            {
+                // Score by keyword overlap between task prompt and worker charter
+                var charterWords = charter.ToLowerInvariant()
+                    .Split(new[] { ' ', '\n', '\r', ',', '.', ';', ':', '(', ')', '[', ']', '/', '-', '_' },
+                        StringSplitOptions.RemoveEmptyEntries)
+                    .Where(w => w.Length > 3)  // skip short words
+                    .Distinct()
+                    .ToHashSet();
+
+                foreach (var word in charterWords)
+                {
+                    if (promptLower.Contains(word))
+                        score++;
+                }
+
+                // Bonus: worker name itself appearing in the prompt (e.g., "firmware" in task, "firmdev" worker)
+                var nameParts = worker.ToLowerInvariant().Split('-', '_');
+                foreach (var part in nameParts.Where(p => p.Length > 3))
+                {
+                    if (promptLower.Contains(part))
+                        score += 2;
+                }
+            }
+            else
+            {
+                // No charter — name-based matching only
+                var nameParts = worker.ToLowerInvariant().Split('-', '_');
+                foreach (var part in nameParts.Where(p => p.Length > 3))
+                {
+                    if (promptLower.Contains(part))
+                        score += 2;
+                }
+            }
+
+            scored.Add((worker, score));
+        }
+
+        // Take workers with score > 0, sorted by relevance, capped at maxWorkers
+        var relevant = scored
+            .Where(s => s.Score > 0)
+            .OrderByDescending(s => s.Score)
+            .Take(maxWorkers)
+            .Select(s => s.Name)
+            .ToList();
+
+        if (relevant.Count > 0)
+        {
+            Debug($"[DISPATCH] SelectRelevantWorkers: {relevant.Count}/{workerNames.Count} matched — {string.Join(", ", relevant)} " +
+                  $"(scores: {string.Join(", ", scored.Where(s => s.Score > 0).OrderByDescending(s => s.Score).Select(s => $"{s.Name}={s.Score}"))})");
+            return relevant;
+        }
+
+        // No keyword matches — fall back to the first worker (better than all)
+        Debug($"[DISPATCH] SelectRelevantWorkers: no keyword matches, falling back to first worker '{workerNames[0]}'");
+        return new List<string> { workerNames[0] };
     }
 
     internal static List<TaskAssignment> ParseTaskAssignments(string orchestratorResponse, List<string> availableWorkers)
@@ -3320,6 +3425,36 @@ public partial class CopilotService
     /// </summary>
     public async Task<SessionGroup?> CreateGroupFromPresetAsync(Models.GroupPreset preset, string? workingDirectory = null, string? worktreeId = null, string? repoId = null, string? nameOverride = null, WorktreeStrategy? strategyOverride = null, CancellationToken ct = default)
     {
+        // In remote mode, delegate entirely to the server so it creates the group,
+        // sessions, roles, and worktrees atomically. Without this, the mobile creates
+        // the group locally but sessions are created on the server in the default group,
+        // and the server's org broadcast races with mobile's local mutations.
+        if (IsRemoteMode)
+        {
+            var payload = new CreateGroupFromPresetPayload
+            {
+                Name = preset.Name,
+                Description = preset.Description,
+                Emoji = preset.Emoji,
+                Mode = preset.Mode.ToString(),
+                OrchestratorModel = preset.OrchestratorModel,
+                WorkerModels = preset.WorkerModels,
+                WorkerSystemPrompts = preset.WorkerSystemPrompts,
+                WorkerDisplayNames = preset.WorkerDisplayNames,
+                SharedContext = preset.SharedContext,
+                RoutingContext = preset.RoutingContext,
+                DefaultWorktreeStrategy = preset.DefaultWorktreeStrategy?.ToString(),
+                MaxReflectIterations = preset.MaxReflectIterations,
+                WorkingDirectory = workingDirectory,
+                WorktreeId = worktreeId,
+                RepoId = repoId,
+                NameOverride = nameOverride,
+                StrategyOverride = strategyOverride?.ToString(),
+            };
+            await _bridgeClient.CreateGroupFromPresetAsync(payload, ct);
+            return null; // server will broadcast the updated organization state
+        }
+
         var teamName = nameOverride ?? preset.Name;
         var strategy = strategyOverride ?? preset.DefaultWorktreeStrategy ?? WorktreeStrategy.Shared;
         var group = CreateMultiAgentGroup(teamName, preset.Mode, worktreeId: worktreeId, repoId: repoId);
@@ -3824,13 +3959,13 @@ public partial class CopilotService
                         }
                         else
                         {
-                            // Nudge also failed — the orchestrator refuses to delegate (likely due to
-                            // stale history from a previous run). Force delegation by creating synthetic
-                            // @worker blocks that assign the original prompt to each worker.
-                            Debug($"[DISPATCH] Nudge failed, forcing delegation to all {workerNames.Count} workers");
+                            // Nudge also failed — use charter-based relevance matching to pick
+                            // only workers suited to this task (not the entire team).
+                            var relevant = SelectRelevantWorkers(prompt, workerNames);
+                            Debug($"[DISPATCH] Nudge failed, targeted dispatch to {relevant.Count}/{workerNames.Count} relevant workers");
                             AddOrchestratorSystemMessage(orchestratorName,
-                                $"⚡ Orchestrator refused to delegate after nudge. Forcing dispatch to all {workerNames.Count} workers.");
-                            assignments = workerNames.Select(w => new TaskAssignment(w, prompt)).ToList();
+                                $"⚡ Orchestrator refused to delegate after nudge. Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
+                            assignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
                             // Fall through to dispatch below
                         }
                     }
@@ -3853,15 +3988,17 @@ public partial class CopilotService
                     }
                     if (!allDispatched && !allAccountedFor && queuedAssignments.Count == 0)
                     {
-                        // Not all workers dispatched or accounted for — force dispatch remaining
+                        // Not all workers dispatched or accounted for — filter remaining
+                        // workers to only those relevant to the task (not the full set).
                         var remaining = workerNames.Where(w => !dispatchedWorkers.Contains(w) && !attemptedWorkers.Contains(w)
                             && !planResponse.Contains(w, StringComparison.OrdinalIgnoreCase)).ToList();
                         if (remaining.Count > 0)
                         {
-                            Debug($"[DISPATCH] Iteration {reflectState.CurrentIteration}: 0 assignments but {remaining.Count} workers never dispatched — forcing: {string.Join(", ", remaining)}");
+                            var relevant = SelectRelevantWorkers(prompt, remaining);
+                            Debug($"[DISPATCH] Iteration {reflectState.CurrentIteration}: 0 assignments, {remaining.Count} never dispatched — targeted dispatch to {relevant.Count}: {string.Join(", ", relevant)}");
                             AddOrchestratorSystemMessage(orchestratorName,
-                                $"⚡ Forcing dispatch to {remaining.Count} remaining worker(s): {string.Join(", ", remaining)}");
-                            assignments = remaining.Select(w => new TaskAssignment(w, prompt)).ToList();
+                                $"⚡ Dispatching to {relevant.Count} relevant worker(s): {string.Join(", ", relevant)}");
+                            assignments = relevant.Select(w => new TaskAssignment(w, prompt)).ToList();
                         }
                         // Fall through to dispatch below
                     }
