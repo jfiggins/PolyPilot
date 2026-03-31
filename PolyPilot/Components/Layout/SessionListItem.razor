@@ -11,6 +11,10 @@
     var sessionDir = GetSessionDirectory();
     var provider = CopilotService.GetProviderForSession(Session.Name);
     var providerDisplayName = CopilotService.GetProviderSessionDisplayName(Session.Name);
+    // Strip group name prefix from multi-agent member cards for cleaner display
+    var displayName = providerDisplayName ?? Session.Name;
+    if (!string.IsNullOrEmpty(GroupName) && displayName.StartsWith(GroupName + "-", StringComparison.OrdinalIgnoreCase))
+        displayName = displayName[(GroupName.Length + 1)..];
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.NeedsAttention ? "needs-attention" :
@@ -61,7 +65,7 @@
                 {
                     <span class="provider-icon" title="@provider.DisplayName">@provider.Icon</span>
                 }
-                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@(providerDisplayName ?? Session.Name)</span>
+                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true" title="@Session.Name">@displayName</span>
                 @if (Meta?.Role == MultiAgentRole.Orchestrator)
                 {
                     <span class="role-badge orchestrator" title="Orchestrator">🎯</span>
@@ -134,7 +138,7 @@
         }
     </div>
     <div class="session-actions">
-        <button class="more-btn" @onclick:stopPropagation="true"
+        <button class="more-btn" @ref="_moreBtnRef" @onclick:stopPropagation="true"
                 @onclick="() => OnToggleMenu.InvokeAsync()" title="More actions">⋯</button>
         @if (IsMenuOpen)
         {
@@ -225,6 +229,12 @@
                         📊 Analyze Efficiency
                     </button>
                 }
+                @if (!string.IsNullOrEmpty(Session.SessionId) && !IsMultiAgentMember)
+                {
+                    <button class="menu-item" @onclick="async () => { await OnCloseMenu.InvokeAsync(); await OnContinueInNewSession.InvokeAsync(); }">
+                        🔄 Continue in new session
+                    </button>
+                }
                 <div class="menu-separator"></div>
                 @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId) && currentGroup?.IsCodespace != true)
                 {
@@ -263,6 +273,7 @@
     [Parameter] public SessionUsageInfo? UsageInfo { get; set; }
     [Parameter] public bool IsWorkerChild { get; set; }
     [Parameter] public bool IsMultiAgentMember { get; set; }
+    [Parameter] public string? GroupName { get; set; }
 
     [Parameter] public EventCallback OnSelect { get; set; }
     [Parameter] public EventCallback OnClose { get; set; }
@@ -276,6 +287,24 @@
     [Parameter] public EventCallback OnReportBug { get; set; }
     [Parameter] public EventCallback OnFixWithCopilot { get; set; }
     [Parameter] public EventCallback OnAnalyze { get; set; }
+    [Parameter] public EventCallback OnContinueInNewSession { get; set; }
+
+    private ElementReference _moreBtnRef;
+    private bool _menuPositioned;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (IsMenuOpen && !_menuPositioned)
+        {
+            _menuPositioned = true;
+            try { await JS.InvokeVoidAsync("positionSessionMenu", _moreBtnRef); }
+            catch { /* element may not be in DOM yet */ }
+        }
+        else if (!IsMenuOpen)
+        {
+            _menuPositioned = false;
+        }
+    }
 
     /// <summary>
     /// Show close confirmation via a JS-created dialog (outside Blazor's DOM tree).

@@ -46,11 +46,13 @@ internal class StubServerManager : IServerManager
 
     public bool CheckServerRunning(string host = "localhost", int? port = null) => IsServerRunning;
 
-    public Task<bool> StartServerAsync(int port)
+    public Task<bool> StartServerAsync(int port, string? githubToken = null)
     {
         ServerPort = port;
+        LastGitHubToken = githubToken;
         return Task.FromResult(StartServerResult);
     }
+    public string? LastGitHubToken { get; private set; }
 
     public void StopServer() { IsServerRunning = false; StopServerCallCount++; }
     public int StopServerCallCount { get; private set; }
@@ -60,6 +62,7 @@ internal class StubServerManager : IServerManager
 internal class StubWsBridgeClient : IWsBridgeClient
 {
     public bool IsConnected { get; set; }
+    public bool ThrowOnSend { get; set; }
     public bool HasReceivedSessionsList { get; set; }
     public List<SessionSummary> Sessions { get; set; } = new();
     public string? ActiveSessionName { get; set; }
@@ -97,8 +100,19 @@ internal class StubWsBridgeClient : IWsBridgeClient
         RequestSessionsCallCount++;
         return Task.CompletedTask;
     }
-    public Task RequestHistoryAsync(string sessionName, int? limit = null, CancellationToken ct = default) => Task.CompletedTask;
-    public Task SendMessageAsync(string sessionName, string message, string? agentMode = null, CancellationToken ct = default) => Task.CompletedTask;
+    public Task RequestHistoryAsync(string sessionName, int? limit = null, CancellationToken ct = default)
+    {
+        // Simulate server response by replacing the reference so the polling loop detects the change
+        if (SessionHistories.TryGetValue(sessionName, out var existing))
+            SessionHistories[sessionName] = new List<ChatMessage>(existing);
+        return Task.CompletedTask;
+    }
+    public Task SendMessageAsync(string sessionName, string message, string? agentMode = null, CancellationToken ct = default)
+    {
+        if (ThrowOnSend)
+            throw new InvalidOperationException("Not connected to server");
+        return Task.CompletedTask;
+    }
     public Task CreateSessionAsync(string name, string? model = null, string? workingDirectory = null, CancellationToken ct = default) => Task.CompletedTask;
     public string? LastSwitchedSession { get; private set; }
     public int SwitchSessionCallCount { get; private set; }
@@ -178,6 +192,12 @@ internal class StubWsBridgeClient : IWsBridgeClient
 
     public Task<FetchImageResponsePayload> FetchImageAsync(string path, CancellationToken ct = default)
         => Task.FromResult(new FetchImageResponsePayload { Error = "Stub" });
+
+    // Test helpers for firing events
+    public void FireTurnStart(string sessionName) => OnTurnStart?.Invoke(sessionName);
+    public void FireTurnEnd(string sessionName) => OnTurnEnd?.Invoke(sessionName);
+    public void FireSessionComplete(string sessionName, string summary = "") => OnSessionComplete?.Invoke(sessionName, summary);
+    public void FireStateChanged() => OnStateChanged?.Invoke();
 }
 
 internal class StubDemoService : IDemoService

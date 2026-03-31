@@ -18,12 +18,35 @@ public partial class CopilotService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, byte> _recentlyClosedRemoteSessions = new();
     // Sessions currently receiving streaming content via bridge events — history sync skipped to avoid duplicates
     private readonly ConcurrentDictionary<string, int> _remoteStreamingSessions = new();
+    // Sessions whose IsProcessing was recently cleared by a TurnEnd bridge event.
+    // Prevents SyncRemoteSessions (debounced sessions_list) from overwriting the authoritative
+    // TurnEnd state with a stale snapshot. Entries auto-expire after 5 seconds.
+    private readonly ConcurrentDictionary<string, DateTime> _recentTurnEndSessions = new();
+
+    /// <summary>
+    /// Drafts queued by "Continue in new session" for the Dashboard to pick up.
+    /// Key = session name, Value = pre-filled prompt text.
+    /// Dashboard consumes entries when it renders the session's input.
+    /// </summary>
+    internal readonly ConcurrentDictionary<string, string> PendingDrafts = new();
 
     /// <summary>
     /// Whether a session's history is still being synced after a turn completed (streaming guard active).
     /// Used by the UI to avoid clearing streaming content before the history sync replaces it.
     /// </summary>
     public bool IsRemoteStreamingGuardActive(string sessionName) => _remoteStreamingSessions.ContainsKey(sessionName);
+    /// <summary>Test-only: activate or deactivate the streaming guard for a session.</summary>
+    internal void SetRemoteStreamingGuardForTesting(string sessionName, bool active)
+    {
+        if (active) _remoteStreamingSessions.TryAdd(sessionName, 0);
+        else _remoteStreamingSessions.TryRemove(sessionName, out _);
+    }
+    /// <summary>Test-only: set or clear the TurnEnd guard that prevents stale sessions_list from re-setting IsProcessing.</summary>
+    internal void SetTurnEndGuardForTesting(string sessionName, bool active)
+    {
+        if (active) _recentTurnEndSessions[sessionName] = DateTime.UtcNow;
+        else _recentTurnEndSessions.TryRemove(sessionName, out _);
+    }
     // Sessions for which history has already been requested — prevents duplicate request storms
     private readonly ConcurrentDictionary<string, byte> _requestedHistorySessions = new();
     // External session IDs currently being resumed — prevents duplicate SDK connections from rapid double-clicks
@@ -57,6 +80,10 @@ public partial class CopilotService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, CodespaceService.TunnelHandle> _tunnelHandles = new();
     // Codespace health-check background task
     private CancellationTokenSource? _codespaceHealthCts;
+    private CancellationTokenSource? _authPollCts;
+    private readonly object _authPollLock = new();
+    private readonly SemaphoreSlim _tokenResolutionLock = new(1, 1);
+    private string? _resolvedGitHubToken;
     private Task? _codespaceHealthTask;
     // Cached dotfiles status — checked once when first SetupRequired state is encountered
     private CodespaceService.DotfilesStatus? _dotfilesStatus;
@@ -274,6 +301,62 @@ public partial class CopilotService : IAsyncDisposable
     public string? ServerHealthNotice { get; private set; }
     public void ClearServerHealthNotice() => ServerHealthNotice = null;
     public void SetServerHealthNotice(string notice) => ServerHealthNotice = notice;
+
+    // Auth notice — shown when the CLI server is not authenticated
+    public string? AuthNotice { get; private set; }
+    public void ClearAuthNotice()
+    {
+        StopAuthPolling();
+        InvokeOnUI(() =>
+        {
+            AuthNotice = null;
+            OnStateChanged?.Invoke();
+        });
+    }
+
+    /// <summary>Returns the full `copilot login` command using the resolved CLI path.</summary>
+    public string GetLoginCommand()
+    {
+        var cliPath = ResolveCopilotCliPath(_currentSettings?.CliSource ?? CliSourceMode.BuiltIn);
+        return string.IsNullOrEmpty(cliPath) ? "copilot login" : $"\"{cliPath}\" login";
+    }
+
+    /// <summary>
+    /// Force-restarts the headless server to pick up fresh credentials, then re-checks auth.
+    /// Called from the Dashboard "Re-authenticate" button after the user runs `copilot login`.
+    /// </summary>
+    public async Task ReauthenticateAsync()
+    {
+        StopAuthPolling();
+        Debug("[AUTH] Re-authenticate requested — forcing server restart to pick up new credentials");
+        // Re-resolve the token off the UI thread — spawns up to 4 child processes
+        // (3× security + 1× gh) which can block for their timeout durations.
+        _resolvedGitHubToken = await Task.Run(() => ResolveGitHubTokenForServer());
+        var recovered = await TryRecoverPersistentServerAsync();
+        if (recovered)
+        {
+            var isAuthenticated = await CheckAuthStatusAsync();
+            if (isAuthenticated)
+            {
+                Debug("[AUTH] Re-authentication successful");
+                _ = FetchGitHubUserInfoAsync();
+            }
+            else
+            {
+                Debug("[AUTH] Server restarted but still not authenticated");
+                // CheckAuthStatusAsync already set AuthNotice and started polling
+            }
+        }
+        else
+        {
+            InvokeOnUI(() =>
+            {
+                AuthNotice = "Server restart failed — please try running `copilot login` again.";
+                StartAuthPolling();
+                OnStateChanged?.Invoke();
+            });
+        }
+    }
 
     // GitHub user info
     public string? GitHubAvatarUrl { get; private set; }
@@ -524,6 +607,11 @@ public partial class CopilotService : IAsyncDisposable
         /// When this reaches WatchdogCaseBMaxStaleChecks, deferral is stopped even if the file
         /// modification time is within the freshness window (dead connection detected).</summary>
         public int WatchdogCaseBStaleCount;
+        /// <summary>True when an IDLE-DEFER has been observed for this session — the CLI reported
+        /// active background tasks (subagents/shells). The watchdog uses this to apply the longer
+        /// multi-agent freshness window even for non-multi-agent-group sessions, because the CLI
+        /// has confirmed it's running background work that won't produce events.jsonl writes.</summary>
+        public volatile bool HasDeferredIdle;
         /// <summary>True if the TurnEnd→Idle fallback was canceled by an AssistantTurnStartEvent.
         /// Used for diagnostic logging: when the next TurnEnd re-arms the fallback, the log shows
         /// the self-healing loop in action (TurnEnd → TurnStart cancel → TurnEnd re-arm).</summary>
@@ -683,7 +771,11 @@ public partial class CopilotService : IAsyncDisposable
         {
             Debug($"[HEALTH] Ping failed after resume/wake ({ex.Message}) — attempting persistent server recovery");
             if (CurrentMode == ConnectionMode.Persistent)
-                _ = Task.Run(() => TryRecoverPersistentServerAsync(), CancellationToken.None);
+                _ = Task.Run(async () =>
+                {
+                    var recovered = await TryRecoverPersistentServerAsync();
+                    if (recovered) _ = CheckAuthStatusAsync();
+                }, CancellationToken.None);
         }
     }
 
@@ -694,9 +786,10 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
             message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
             message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
-            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
+            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ACTIVE") || message.StartsWith("[RESUME-QUIESCE") || message.StartsWith("[RESUME-CHECK") ||
             message.StartsWith("[KEEPALIVE") || message.StartsWith("[ERROR") ||
             message.StartsWith("[ABORT") || message.StartsWith("[BRIDGE") ||
+            message.StartsWith("[SYNC") ||
             message.Contains("watchdog") || message.Contains("Failed to");
     }
 
@@ -866,10 +959,17 @@ public partial class CopilotService : IAsyncDisposable
         // In Persistent mode, auto-start the server if not already running
         if (settings.Mode == ConnectionMode.Persistent)
         {
+            // Only forward tokens from env vars at startup — no Keychain read (would
+            // trigger a macOS password dialog for every user). If the server can't
+            // self-authenticate, CheckAuthStatusAsync below will detect it and lazily
+            // resolve the full token chain (including Keychain) on first auth failure.
+            // See .claude/skills/auth-token-safety/SKILL.md (INV-A1).
+            _resolvedGitHubToken ??= ResolveGitHubTokenFromEnv();
+
             if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
             {
                 Debug($"Persistent server not running, auto-starting on port {settings.Port}...");
-                var started = await _serverManager.StartServerAsync(settings.Port);
+                var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
                 if (!started)
                 {
                     Debug("Failed to auto-start server, falling back to Embedded mode");
@@ -916,7 +1016,7 @@ public partial class CopilotService : IAsyncDisposable
                 await Task.Delay(250, cancellationToken);
             }
 
-            var restarted = await _serverManager.StartServerAsync(settings.Port);
+            var restarted = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
             if (restarted)
             {
                 Debug("Server restarted, retrying connection...");
@@ -990,6 +1090,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Fetch GitHub user info for avatar
         _ = FetchGitHubUserInfoAsync();
+
+        // Check auth status — surface a banner if not authenticated
+        _ = CheckAuthStatusAsync();
 
         // Load organization state FIRST (groups, pinning, sorting) so reconcile during restore doesn't wipe it
         LoadOrganization();
@@ -1091,6 +1194,7 @@ public partial class CopilotService : IAsyncDisposable
         _sessions.Clear();
         _closedSessionIds.Clear();
         _closedSessionNames.Clear();
+        _recentTurnEndSessions.Clear();
         lock (_imageQueueLock)
         {
             _queuedImagePaths.Clear();
@@ -1119,6 +1223,9 @@ public partial class CopilotService : IAsyncDisposable
         IsRemoteMode = false;
         IsDemoMode = false;
         FallbackNotice = null; // Clear any previous fallback notice
+        AuthNotice = null; // Clear any previous auth notice
+        _resolvedGitHubToken = null; // Force re-resolve on next server start
+        StopAuthPolling();
         CurrentMode = settings.Mode;
         CodespacesEnabled = settings.CodespacesEnabled && settings.Mode == ConnectionMode.Embedded;
         OnStateChanged?.Invoke();
@@ -1227,8 +1334,17 @@ public partial class CopilotService : IAsyncDisposable
                 await Task.Delay(250);
             }
 
-            // Start a fresh server — this forces the CLI to re-authenticate with GitHub
-            var started = await _serverManager.StartServerAsync(settings.Port);
+            // Save whatever token was resolved (may be null for watchdog callers, or a
+            // freshly-resolved token from ReauthenticateAsync/CheckAuthStatusAsync).
+            // Then clear the field so future auth failures trigger lazy Keychain resolution.
+            // See .claude/skills/auth-token-safety/SKILL.md (INV-A3).
+            var tokenToForward = _resolvedGitHubToken;
+            _resolvedGitHubToken = null;
+
+            // Start a fresh server — forwards the saved token (if any) or null to let
+            // the server try native Keychain auth. If native auth fails and tokenToForward
+            // was null, CheckAuthStatusAsync will lazily resolve a fresh token.
+            var started = await _serverManager.StartServerAsync(settings.Port, tokenToForward);
             if (!started)
             {
                 Debug("[SERVER-RECOVERY] Failed to restart persistent server");
@@ -1304,6 +1420,7 @@ public partial class CopilotService : IAsyncDisposable
             _sessions.Clear();
             _closedSessionIds.Clear();
             _closedSessionNames.Clear();
+            _recentTurnEndSessions.Clear();
 
             // 2. Dispose old client
             if (_client != null)
@@ -1325,7 +1442,7 @@ public partial class CopilotService : IAsyncDisposable
             }
 
             // 5. Start fresh server (will extract current native modules)
-            var started = await _serverManager.StartServerAsync(restartSettings.Port);
+            var started = await _serverManager.StartServerAsync(restartSettings.Port, _resolvedGitHubToken);
             if (!started)
             {
                 Debug("[SERVER-RESTART] Failed to restart server");
@@ -1910,6 +2027,104 @@ The user can also check configured servers with the /mcp command.
         return agents;
     }
 
+    /// <summary>
+    /// Lists agents available in the current session via the SDK AgentApi.
+    /// Returns an empty list if the session doesn't exist, is not connected, or the API fails.
+    /// </summary>
+    public async Task<List<AgentInfo>> ListAgentsFromApiAsync(string sessionName)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state) || state.Session == null)
+            return [];
+
+        try
+        {
+            var result = await state.Session.Rpc.Agent.ListAsync(CancellationToken.None);
+            return result?.Agents?
+                .Where(a => !string.IsNullOrEmpty(a?.Name))
+                .Select(a => new AgentInfo(
+                    a!.Name!,
+                    a.Description ?? a.DisplayName ?? "",
+                    "cli"))
+                .ToList() ?? [];
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Agents] ListAsync failed for '{sessionName}': {ex.Message}");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Selects a CLI agent for the given session via the SDK AgentApi.
+    /// Returns true on success, false on error.
+    /// </summary>
+    public async Task<bool> SelectAgentAsync(string sessionName, string agentName)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state) || state.Session == null)
+            return false;
+
+        try
+        {
+            await state.Session.Rpc.Agent.SelectAsync(agentName, CancellationToken.None);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Agents] SelectAsync('{agentName}') failed for '{sessionName}': {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deselects the active CLI agent for the given session.
+    /// Returns true on success, false on error.
+    /// </summary>
+    public async Task<bool> DeselectAgentAsync(string sessionName)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state) || state.Session == null)
+            return false;
+
+        try
+        {
+            await state.Session.Rpc.Agent.DeselectAsync(CancellationToken.None);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[Agents] DeselectAsync failed for '{sessionName}': {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Starts fleet mode (parallel subagent execution) for the given session with the provided prompt.
+    /// Returns (true, null) on success or (false, reason) on failure.
+    /// </summary>
+    public async Task<(bool Started, string? Error)> StartFleetAsync(string sessionName, string prompt)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state))
+            return (false, "Session not found.");
+
+        if (state.Session == null)
+            return (false, "Session is not connected (Session object is null).");
+
+        if (state.Info.IsProcessing)
+            return (false, "Session is currently processing. Wait for it to finish.");
+
+        try
+        {
+            var result = await state.Session.Rpc.Fleet.StartAsync(prompt, CancellationToken.None);
+            if (result?.Started == true)
+                return (true, null);
+            return (false, "CLI returned Started=false. Fleet mode may not be supported by this CLI version.");
+        }
+        catch (Exception ex)
+        {
+            Debug($"[Fleet] StartAsync failed for '{sessionName}': {ex.GetType().Name}: {ex.Message}");
+            return (false, "RPC error communicating with CLI. Check logs for details.");
+        }
+    }
+
     private static void ScanAgentDirectory(string agentsDir, string source, List<AgentInfo> agents, HashSet<string> seen)
     {
         foreach (var file in Directory.GetFiles(agentsDir, "*.md"))
@@ -2086,7 +2301,7 @@ The user can also check configured servers with the /mcp command.
         }
 
         // Resume the session using the SDK — pass model and working directory so backend context is preserved
-        var resumeModel = Models.ModelHelper.NormalizeToSlug(model ?? GetSessionModelFromDisk(sessionId) ?? DefaultModel);
+        var resumeModel = Models.ModelHelper.NormalizeToSlug(GetSessionModelFromDisk(sessionId) ?? model ?? DefaultModel);
         if (string.IsNullOrEmpty(resumeModel)) resumeModel = DefaultModel;
         Debug($"Resuming session '{displayName}' with model: '{resumeModel}', cwd: '{resumeWorkingDirectory}'");
         var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions };
@@ -2440,7 +2655,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
                 {
                     Debug("Persistent server not running, restarting...");
-                    var started = await _serverManager.StartServerAsync(settings.Port);
+                    var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
                     if (!started)
                     {
                         Debug("Failed to restart persistent server");
@@ -2971,6 +3186,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // In remote mode, delegate to WsBridgeClient
         if (IsRemoteMode)
         {
+            if (!_bridgeClient.IsConnected)
+                throw new InvalidOperationException("Not connected to server. Reconnecting…");
+
             // Add user message locally for immediate UI feedback
             var session = GetRemoteSession(sessionName);
             if (session != null && !skipHistoryMessage)
@@ -2982,7 +3200,20 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             if (session != null)
                 session.IsProcessing = true;
             OnStateChanged?.Invoke();
-            await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, cancellationToken);
+            try
+            {
+                await _bridgeClient.SendMessageAsync(sessionName, prompt, agentMode, cancellationToken);
+            }
+            catch
+            {
+                // Send failed (disconnected) — clean up processing state
+                if (session != null)
+                {
+                    session.IsProcessing = false;
+                    OnStateChanged?.Invoke();
+                }
+                throw;
+            }
             return ""; // Response comes via events
         }
 
@@ -3037,6 +3268,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ClearPermissionDenials();
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
+        state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
         state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
@@ -3171,7 +3403,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             if (CurrentMode == ConnectionMode.Persistent &&
                                 !_serverManager.CheckServerRunning("127.0.0.1", reinitSettings.Port))
                             {
-                                await _serverManager.StartServerAsync(reinitSettings.Port);
+                                await _serverManager.StartServerAsync(reinitSettings.Port, _resolvedGitHubToken);
                             }
                             _client = CreateClient(reinitSettings);
                             await _client.StartAsync(cancellationToken);
@@ -3212,7 +3444,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                     !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
                                 {
                                     Debug("Persistent server not running, restarting...");
-                                    var started = await _serverManager.StartServerAsync(connSettings.Port);
+                                    var started = await _serverManager.StartServerAsync(connSettings.Port, _resolvedGitHubToken);
                                     if (!started)
                                     {
                                         Debug("Failed to restart persistent server");
@@ -3340,6 +3572,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                                     };
                                                     // Mirror primary reconnect: reset tool tracking for new connection
                                                     siblingState.HasUsedToolsThisTurn = false;
+                                                    siblingState.HasDeferredIdle = false;
                                                     Interlocked.Exchange(ref siblingState.ActiveToolCallCount, 0);
                                                     Interlocked.Exchange(ref siblingState.SuccessfulToolCountThisTurn, 0);
                                                     Interlocked.Exchange(ref siblingState.ToolHealthStaleChecks, 0);
@@ -3551,6 +3784,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // inflates the watchdog timeout from 120s to 600s, making stuck
                     // sessions wait 5x longer than necessary to recover.
                     newState.HasUsedToolsThisTurn = false;
+                    newState.HasDeferredIdle = false;
                     Interlocked.Exchange(ref newState.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, 0);
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
@@ -3586,6 +3820,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // Reset HasUsedToolsThisTurn so the retried turn starts with the default
                     // 120s watchdog tier instead of the inflated 600s from stale tool state.
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
 
                     // Schedule persistence of the new session ID so it survives app restart.
                     // Without this, the debounced save captures the pre-reconnect snapshot
@@ -3648,6 +3883,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     Debug($"[ERROR] '{sessionName}' reconnect+retry failed, clearing IsProcessing");
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     state.Info.IsResumed = false;
                     state.Info.IsProcessing = false;
@@ -3670,6 +3906,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Debug($"[ERROR] '{sessionName}' SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.Info.IsProcessing = false;
@@ -3887,6 +4124,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ProcessingPhase = 0;
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
+        state.HasDeferredIdle = false;
         state.IsReconnectedSend = false; // INV-1: clear all per-turn flags on abort
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
         // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
@@ -3994,6 +4232,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Debug($"[STEER-ERROR] '{sessionName}' soft steer SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 Interlocked.Exchange(ref state.SendingFlag, 0);
@@ -4279,6 +4518,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.Info.IsProcessing = false;
                     state.Info.IsResumed = false;
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     state.Info.ProcessingStartedAt = null;
@@ -4369,7 +4609,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         _activeSessionName = name;
         if (IsRemoteMode)
-            _ = _bridgeClient.SwitchSessionAsync(name);
+            _ = _bridgeClient.SwitchSessionAsync(name)
+                .ContinueWith(t => Console.WriteLine($"[CopilotService] SwitchSession bridge error: {t.Exception?.InnerException?.Message}"),
+                    TaskContinuationOptions.OnlyOnFaulted);
         OnStateChanged?.Invoke();
         return true;
     }
@@ -4484,7 +4726,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             _activeSessionName = name;
             activeState.Info.LastUpdatedAt = DateTime.Now;
             if (IsRemoteMode)
-                _ = _bridgeClient.SwitchSessionAsync(name);
+                _ = _bridgeClient.SwitchSessionAsync(name)
+                    .ContinueWith(t => Console.WriteLine($"[CopilotService] SwitchSession bridge error: {t.Exception?.InnerException?.Message}"),
+                        TaskContinuationOptions.OnlyOnFaulted);
         }
     }
 
@@ -4615,6 +4859,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         StopKeepalivePing();
         await StopCodespaceHealthCheckAsync();
         StopExternalSessionScanner();
+        StopAuthPolling();
 
         // Flush any pending debounced writes immediately
         FlushSaveActiveSessionsToDisk();
@@ -4656,6 +4901,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             try { await _client.DisposeAsync(); } catch { }
         }
         _recoveryLock.Dispose();
+        _tokenResolutionLock.Dispose();
     }
 
     private void StartExternalSessionScannerIfNeeded()
@@ -4801,6 +5047,8 @@ public class UiState
     public HashSet<string> CompletedTutorials { get; set; } = new();
     public int GridColumns { get; set; } = 3;
     public int CardMinHeight { get; set; } = 250;
+    /// <summary>Draft text per session, saved before auto-update relaunch so users don't lose in-progress messages.</summary>
+    public Dictionary<string, string> Drafts { get; set; } = new();
 }
 
 public class ActiveSessionEntry

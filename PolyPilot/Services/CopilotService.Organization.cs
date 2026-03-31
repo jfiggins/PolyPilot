@@ -38,7 +38,10 @@ public partial class CopilotService
     private static readonly TimeSpan WorkerExecutionTimeoutRemote = TimeSpan.FromMinutes(10);
     private static readonly Regex WorkerNamePattern = new(@"-[Ww]orker-\d+(-\d+)?$", RegexOptions.Compiled);
 
-    /// <summary>How long to poll for premature idle indicators after the initial TCS completes.
+    /// <summary>Maximum time the orchestrator waits for all workers to complete.
+    /// Shorter than WorkerExecutionTimeout — if a worker is stuck, the orchestrator
+    /// proceeds with partial results rather than blocking the group forever.</summary>
+    private static readonly TimeSpan OrchestratorCollectionTimeout = TimeSpan.FromMinutes(15);
     /// Checks both WasPrematurelyIdled flag (set by EVT-REARM) and events.jsonl freshness
     /// (CLI still writing events). The events.jsonl check catches cases where EVT-REARM
     /// takes 30-60s to fire.</summary>
@@ -80,6 +83,11 @@ public partial class CopilotService
     // Drained at the start of each loop iteration and sent to the orchestrator
     // so the model sees them in its conversation context.
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _reflectQueuedPrompts = new();
+
+    // Per-group queued user prompts for non-reflect Orchestrator mode.
+    // When a user sends a message while an orchestrator dispatch is running,
+    // the message is queued here and drained after the current dispatch completes.
+    private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orchestratorQueuedPrompts = new();
 
     #region Session Organization (groups, pinning, sorting)
 
@@ -1019,7 +1027,9 @@ public partial class CopilotService
             RemoveGroupsWhere(g => g.Id == groupId);
             OnStateChanged?.Invoke();
             // Tell server to do the real cleanup
-            _ = _bridgeClient.SendOrganizationCommandAsync(new OrganizationCommandPayload { Command = "delete_group", GroupId = groupId });
+            _ = _bridgeClient.SendOrganizationCommandAsync(new OrganizationCommandPayload { Command = "delete_group", GroupId = groupId })
+                .ContinueWith(t => Console.WriteLine($"[CopilotService] DeleteGroup bridge error: {t.Exception?.InnerException?.Message}"),
+                    TaskContinuationOptions.OnlyOnFaulted);
             return;
         }
 
@@ -1028,6 +1038,9 @@ public partial class CopilotService
 
         // Collect all worktree IDs for cleanup before removing metadata
         var worktreeIds = new HashSet<string>();
+
+        // Clean up orchestrator queue state for this group
+        _orchestratorQueuedPrompts.TryRemove(groupId, out _);
         if (group2?.WorktreeId != null) worktreeIds.Add(group2.WorktreeId);
         // CreatedWorktreeIds is the authoritative list (covers cases where session creation failed)
         if (group2?.CreatedWorktreeIds != null)
@@ -1624,6 +1637,68 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Safety net: detect orchestrator responses with @worker blocks that were sent via SendPromptAsync
+    /// (bypassing the multi-agent dispatch pipeline) and dispatch the orphaned worker assignments.
+    /// This catches race conditions where the dispatch routing in Dashboard.razor or Events.cs
+    /// fails to route through SendToMultiAgentGroupAsync.
+    /// </summary>
+    internal void TryDispatchOrphanedOrchestratorResponse(string sessionName, string response)
+    {
+        if (string.IsNullOrEmpty(response)) return;
+
+        // Only relevant for orchestrator sessions
+        var groupId = GetOrchestratorGroupId(sessionName);
+        if (groupId == null) return;
+
+        // If a reflect loop is actively running for this group, the loop will handle
+        // the response via the TCS — this is not an orphan.
+        var loopLock = _reflectLoopLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (!loopLock.Wait(0))
+        {
+            // Loop is running — not orphaned
+            return;
+        }
+        loopLock.Release();
+
+        // If the dispatch lock is held, someone is actively dispatching — not orphaned.
+        var dispatchLock = _groupDispatchLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
+        if (!dispatchLock.Wait(0))
+        {
+            return;
+        }
+        dispatchLock.Release();
+
+        // Check if response contains @worker blocks
+        var workerNames = GetMultiAgentGroupMembers(groupId)
+            .Where(m => m != sessionName).ToList();
+        if (workerNames.Count == 0) return;
+
+        var assignments = ParseTaskAssignments(response, workerNames);
+        if (assignments.Count == 0) return;
+
+        // This IS an orphaned orchestrator response — dispatch the workers
+        Debug($"[DISPATCH-ORPHAN] Detected orphaned orchestrator response from '{sessionName}' with " +
+              $"{assignments.Count} @worker assignments. Dispatching via orchestration pipeline.");
+        AddOrchestratorSystemMessage(sessionName,
+            $"🔄 Safety net: detected {assignments.Count} undispatched worker assignment(s) — dispatching now.");
+
+        // Route through the full pipeline so reflection/synthesis happens
+        SafeFireAndForget(Task.Run(async () =>
+        {
+            try
+            {
+                // Small delay to let CompleteResponse fully unwind
+                await Task.Delay(200);
+                await SendToMultiAgentGroupAsync(groupId, response);
+            }
+            catch (Exception ex)
+            {
+                Debug($"[DISPATCH-ORPHAN] Failed to dispatch orphaned response: {ex.Message}");
+            }
+        }), "orphaned-orchestrator-dispatch");
+    }
+
+    /// <summary>
     /// Try to queue a prompt directly into the active reflect loop for the given orchestrator.
     /// Returns true if the loop is running and the prompt was queued (will be drained at next iteration).
     /// Returns false if no reflect loop is active — caller should fall back to EnqueueMessage.
@@ -1662,9 +1737,31 @@ public partial class CopilotService
         if (members.Count == 0) { Debug($"[DISPATCH] SendToMultiAgentGroupAsync: no members for group '{group.Name}'"); return; }
 
         // Serialize dispatches to the same group (bridge + event queue drain race).
-        // Callers wait their turn rather than being dropped.
+        // For Orchestrator mode: non-blocking check — queue if busy, with user feedback.
+        // For other modes: blocking wait (they complete quickly).
         var dispatchLock = _groupDispatchLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
-        await dispatchLock.WaitAsync(cancellationToken);
+
+        if (group.OrchestratorMode == MultiAgentMode.Orchestrator)
+        {
+            if (!dispatchLock.Wait(0))
+            {
+                // Orchestrator is busy — queue the prompt and show feedback
+                var orchestratorName = GetOrchestratorSession(groupId);
+                Debug($"[DISPATCH] Orchestrator busy for group '{group.Name}' — queuing prompt for after current dispatch");
+                var queue = _orchestratorQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+                queue.Enqueue(prompt);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"📨 New task queued (will be sent to orchestrator when current work completes): {prompt}");
+                }
+                return;
+            }
+        }
+        else
+        {
+            await dispatchLock.WaitAsync(cancellationToken);
+        }
 
         try
         {
@@ -1682,6 +1779,8 @@ public partial class CopilotService
 
                 case MultiAgentMode.Orchestrator:
                     await SendViaOrchestratorAsync(groupId, members, prompt, cancellationToken);
+                    // Drain any prompts queued while this dispatch was running
+                    await DrainOrchestratorQueueAsync(groupId, members, cancellationToken);
                     break;
 
                 case MultiAgentMode.OrchestratorReflect:
@@ -1701,9 +1800,54 @@ public partial class CopilotService
     }
 
     /// <summary>
-    /// Build a multi-agent context prefix for a session in a group.
-    /// Includes model info for each member so agents know each other's capabilities.
+    /// Drain queued user prompts that arrived while a non-reflect orchestrator dispatch was running.
+    /// Each queued prompt is sent to the orchestrator as a new task, which dispatches to available workers.
+    /// Called while still holding the dispatch lock, so no new dispatches can interleave.
+    /// Capped at 3 per cycle to prevent unbounded lock holding.
     /// </summary>
+    private async Task DrainOrchestratorQueueAsync(string groupId, List<string> members, CancellationToken cancellationToken)
+    {
+        if (!_orchestratorQueuedPrompts.TryGetValue(groupId, out var queue))
+            return;
+
+        const int maxDrainPerCycle = 3;
+        int drained = 0;
+        while (drained < maxDrainPerCycle && queue.TryDequeue(out var queuedPrompt))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Debug($"[DISPATCH] Draining queued orchestrator prompt for group '{groupId}' (len={queuedPrompt.Length})");
+
+            try
+            {
+                await SendViaOrchestratorAsync(groupId, members, queuedPrompt, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Debug($"[DISPATCH] Queued orchestrator prompt failed: {ex.GetType().Name}: {ex.Message}");
+                var orchestratorName = GetOrchestratorSession(groupId);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"⚠️ Failed to process queued task: {ex.Message}");
+                }
+            }
+            drained++;
+        }
+
+        // If there are still queued prompts, notify the user
+        if (queue.Count > 0)
+        {
+            Debug($"[DISPATCH] {queue.Count} queued prompt(s) remain after draining {drained} — will process on next cycle");
+            var orchName = GetOrchestratorSession(groupId);
+            if (orchName != null)
+            {
+                AddOrchestratorSystemMessage(orchName,
+                    $"📨 {queue.Count} queued message(s) remaining — will process after this cycle completes.");
+            }
+        }
+    }
+
+    /// <summary>
     private string BuildMultiAgentPrefix(string sessionName, SessionGroup group, List<string> allMembers)
     {
         var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
@@ -1835,6 +1979,7 @@ public partial class CopilotService
 
         var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
         Debug($"[DISPATCH] '{orchestratorName}' iteration 0: {rawAssignments.Count} raw assignments. Response length={planResponse.Length}");
+        LogUnresolvedWorkerNames(planResponse, rawAssignments, workerNames, orchestratorName);
 
         var iterAssignments = DeduplicateAssignments(rawAssignments, dispatchedWorkers);
 
@@ -1930,7 +2075,53 @@ public partial class CopilotService
                 if (workerTasks.Count < assignments.Count)
                     await Task.Delay(1000, cancellationToken);
             }
-            var results = await Task.WhenAll(workerTasks);
+
+            // Bounded wait: if any worker is stuck, proceed with partial results
+            // rather than blocking the entire orchestrator group indefinitely.
+            var allDone = Task.WhenAll(workerTasks);
+            // Use CancellationToken.None for the timeout delay — if the caller's token
+            // is cancelled, Task.WhenAny returns the cancelled allDone (not timeout),
+            // and OperationCanceledException propagates cleanly without entering the
+            // force-complete branch.
+            var timeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            WorkerResult[] results;
+            if (await Task.WhenAny(allDone, timeout) != allDone)
+            {
+                Debug($"[DISPATCH] Orchestrator collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers");
+                foreach (var a in assignments)
+                {
+                    if (_sessions.TryGetValue(a.WorkerName, out var ws))
+                    {
+                        if (ws.Info.IsProcessing)
+                        {
+                            Debug($"[DISPATCH] Force-completing stuck worker '{a.WorkerName}'");
+                            AddOrchestratorSystemMessage(a.WorkerName,
+                                "⚠️ Worker timed out — orchestrator is proceeding with partial results.");
+                            await ForceCompleteProcessingAsync(a.WorkerName, ws, $"orchestrator collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m)");
+                        }
+                        else if (ws.ResponseCompletion?.Task.IsCompleted == false)
+                        {
+                            // Worker hasn't started processing yet (e.g., stuck in SendAsync).
+                            // Resolve the TCS so ExecuteWorkerAsync unblocks.
+                            Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
+                            ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
+                        }
+                    }
+                }
+                // Collect results — all tasks should now be completed (force-completed or already done).
+                // Use try/catch since force-completed tasks may fault.
+                var partialResults = new List<WorkerResult>();
+                foreach (var t in workerTasks)
+                {
+                    try { partialResults.Add(await t); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                }
+                results = partialResults.ToArray();
+            }
+            else
+            {
+                results = await allDone;
+            }
 
             // After early dispatch, the orchestrator may still be doing tool work.
             await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
@@ -2165,13 +2356,46 @@ public partial class CopilotService
             var task = match.Groups[2].Value.Trim();
             if (string.IsNullOrEmpty(task)) continue;
 
-            // Exact match only — no fuzzy bidirectional Contains (caused misroutes)
-            var resolved = availableWorkers.FirstOrDefault(w =>
-                w.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+            var resolved = ResolveWorkerName(workerName, availableWorkers);
             if (resolved != null)
                 assignments.Add(new TaskAssignment(resolved, task));
         }
         return assignments;
+    }
+
+    /// <summary>
+    /// Resolves a worker name from an orchestrator response to a full session name.
+    /// Tries exact match first, then falls back to suffix matching with a word boundary
+    /// guard (preceded by '-' or ' '). Suffix match only used when unambiguous (exactly 1 candidate).
+    /// </summary>
+    internal static string? ResolveWorkerName(string workerName, List<string> availableWorkers)
+    {
+        // 1. Exact match (case-insensitive) — always preferred
+        var exact = availableWorkers.FirstOrDefault(w =>
+            w.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+        if (exact != null) return exact;
+
+        // 2. Suffix match with word boundary: the model often abbreviates
+        //    "tuul A Team-srdev-1" to just "srdev-1" in @worker blocks.
+        //    Only accept if exactly one worker matches (ambiguity guard).
+        var suffixMatches = availableWorkers.Where(w => IsSuffixMatch(w, workerName)).ToList();
+        if (suffixMatches.Count == 1)
+            return suffixMatches[0];
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if <paramref name="fullName"/> ends with <paramref name="suffix"/> at a word boundary
+    /// (preceded by '-' or ' '). Prevents false matches like "rdev-1" matching "srdev-1".
+    /// </summary>
+    internal static bool IsSuffixMatch(string fullName, string suffix)
+    {
+        if (string.IsNullOrEmpty(suffix)) return false;
+        if (!fullName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return false;
+        if (fullName.Length == suffix.Length) return true; // exact match
+        var preceding = fullName[fullName.Length - suffix.Length - 1];
+        return preceding == '-' || preceding == ' ';
     }
 
     /// <summary>
@@ -2199,14 +2423,37 @@ public partial class CopilotService
                 var task = element.TryGetProperty("task", out var t) ? t.GetString() : null;
                 if (string.IsNullOrEmpty(workerName) || string.IsNullOrEmpty(task)) continue;
 
-                var resolved = availableWorkers.FirstOrDefault(wk =>
-                    wk.Equals(workerName, StringComparison.OrdinalIgnoreCase));
+                var resolved = ResolveWorkerName(workerName, availableWorkers);
                 if (resolved != null)
                     assignments.Add(new TaskAssignment(resolved, task));
             }
         }
         catch (System.Text.Json.JsonException) { /* Not valid JSON — fall through to regex */ }
         return assignments;
+    }
+
+    /// <summary>
+    /// Logs diagnostic information when @worker blocks are present in the response
+    /// but ParseTaskAssignments resolved fewer assignments than expected.
+    /// </summary>
+    private void LogUnresolvedWorkerNames(string response, List<TaskAssignment> resolved, List<string> availableWorkers, string orchestratorName)
+    {
+        // Extract all @worker:name references from the response
+        var namePattern = @"@worker:([^\n]+?)(?:\s*\n|$)";
+        var mentioned = Regex.Matches(response, namePattern, RegexOptions.IgnoreCase)
+            .Cast<Match>()
+            .Select(m => m.Groups[1].Value.Trim().Trim('`', '\'', '"'))
+            .Where(n => !string.IsNullOrEmpty(n))
+            .ToList();
+
+        if (mentioned.Count == 0 || mentioned.Count == resolved.Count) return;
+
+        var resolvedNames = new HashSet<string>(resolved.Select(r => r.WorkerName), StringComparer.OrdinalIgnoreCase);
+        var unresolved = mentioned.Where(n => ResolveWorkerName(n, availableWorkers) == null || !resolvedNames.Contains(ResolveWorkerName(n, availableWorkers)!)).ToList();
+        if (unresolved.Count > 0)
+        {
+            Debug($"[DISPATCH] '{orchestratorName}' had {unresolved.Count} unresolved @worker name(s): [{string.Join(", ", unresolved)}]. Available: [{string.Join(", ", availableWorkers)}]");
+        }
     }
 
     private record WorkerResult(string WorkerName, string? Response, bool Success, string? Error, TimeSpan Duration);
@@ -2242,6 +2489,7 @@ public partial class CopilotService
                 Interlocked.Exchange(ref state.WatchdogCaseBLastFileSize, 0);
                 Interlocked.Exchange(ref state.WatchdogCaseBStaleCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 state.FallbackCanceledByTurnStart = false;
                 state.Info.IsResumed = false;
                 state.Info.ProcessingStartedAt = null;
@@ -2347,6 +2595,21 @@ public partial class CopilotService
 
         const int maxRetries = 2;
         var dispatchTime = DateTime.Now;
+
+        // Pre-dispatch: if worker state is orphaned (e.g., from a failed reconnect),
+        // attempt to create a fresh session. Dispatching to an orphaned state would hang
+        // indefinitely because no event handler is registered on orphaned states.
+        if (_sessions.TryGetValue(workerName, out var orphanCheck) && orphanCheck.IsOrphaned)
+        {
+            Debug($"[DISPATCH] Worker '{workerName}' state is orphaned — attempting fresh session recovery");
+            var recovered = await TryRecoverWithFreshSessionAsync(workerName, cancellationToken);
+            if (!recovered)
+            {
+                Debug($"[DISPATCH] Worker '{workerName}' fresh session recovery failed — returning error");
+                return new WorkerResult(workerName, null, false, "Worker session is orphaned and recovery failed", sw.Elapsed);
+            }
+            Debug($"[DISPATCH] Worker '{workerName}' recovered with fresh session — proceeding with dispatch");
+        }
 
         // Pre-dispatch: if worker is still processing from a previous run (e.g., restored
         // mid-processing after app relaunch), wait for it to become idle. The watchdog will
@@ -3897,6 +4160,7 @@ public partial class CopilotService
 
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
+            LogUnresolvedWorkerNames(planResponse, rawAssignments, workerNames, orchestratorName);
             var assignments = DeduplicateAssignments(rawAssignments);
 
             if (assignments.Count == 0)
@@ -4041,8 +4305,54 @@ public partial class CopilotService
 
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.WaitingForWorkers, iterDetail));
 
-            var workerTasks = assignments.Select(a => ExecuteWorkerAsync(a.WorkerName, a.Task, prompt, ct));
-            var results = await Task.WhenAll(workerTasks);
+            // Stagger workers with 1s delay (matching non-reflect dispatch path)
+            var workerTasks = new List<Task<WorkerResult>>();
+            foreach (var a in assignments)
+            {
+                workerTasks.Add(ExecuteWorkerAsync(a.WorkerName, a.Task, prompt, ct));
+                if (workerTasks.Count < assignments.Count)
+                    await Task.Delay(1000, ct);
+            }
+
+            // Bounded wait: if any worker is stuck, proceed with partial results
+            // rather than blocking the reflect loop indefinitely. Uses CancellationToken.None
+            // so the caller's token doesn't interfere with the timeout detection.
+            var allDone = Task.WhenAll(workerTasks);
+            var collectionTimeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            WorkerResult[] results;
+            if (await Task.WhenAny(allDone, collectionTimeout) != allDone)
+            {
+                Debug($"[DISPATCH] Reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers (iteration {reflectState.CurrentIteration})");
+                foreach (var a in assignments)
+                {
+                    if (_sessions.TryGetValue(a.WorkerName, out var ws))
+                    {
+                        if (ws.Info.IsProcessing)
+                        {
+                            Debug($"[DISPATCH] Force-completing stuck worker '{a.WorkerName}'");
+                            AddOrchestratorSystemMessage(a.WorkerName,
+                                "⚠️ Worker timed out — orchestrator is proceeding with partial results.");
+                            await ForceCompleteProcessingAsync(a.WorkerName, ws, $"reflect collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m)");
+                        }
+                        else if (ws.ResponseCompletion?.Task.IsCompleted == false)
+                        {
+                            Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
+                            ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
+                        }
+                    }
+                }
+                var partialResults = new List<WorkerResult>();
+                foreach (var t in workerTasks)
+                {
+                    try { partialResults.Add(await t); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                }
+                results = partialResults.ToArray();
+            }
+            else
+            {
+                results = await allDone;
+            }
 
             // Track both attempted and successful workers across all iterations
             foreach (var a in assignments)

@@ -54,11 +54,13 @@ public partial class CopilotService
         ["SessionCompactionCompleteEvent"] = EventVisibility.TimelineOnly,
         ["PendingMessagesModifiedEvent"] = EventVisibility.TimelineOnly,
         ["ToolUserRequestedEvent"] = EventVisibility.TimelineOnly,
-        ["SkillInvokedEvent"] = EventVisibility.TimelineOnly,
-        ["SubagentSelectedEvent"] = EventVisibility.TimelineOnly,
-        ["SubagentStartedEvent"] = EventVisibility.TimelineOnly,
-        ["SubagentCompletedEvent"] = EventVisibility.TimelineOnly,
-        ["SubagentFailedEvent"] = EventVisibility.TimelineOnly,
+        ["SkillInvokedEvent"] = EventVisibility.ChatVisible,
+        ["SubagentSelectedEvent"] = EventVisibility.ChatVisible,
+        ["SubagentDeselectedEvent"] = EventVisibility.ChatVisible,
+        ["SubagentStartedEvent"] = EventVisibility.ChatVisible,
+        ["SubagentCompletedEvent"] = EventVisibility.ChatVisible,
+        ["SubagentFailedEvent"] = EventVisibility.ChatVisible,
+        ["CommandsChangedEvent"] = EventVisibility.TimelineOnly,
 
         // Currently noisy internal events
         ["SessionLifecycleEvent"] = EventVisibility.Ignore,
@@ -231,7 +233,9 @@ public partial class CopilotService
             // JSON-RPC connection is alive, so future Case A resets are legitimate.
             Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
             Interlocked.Exchange(ref state.WatchdogCaseBResets, 0);
-            Interlocked.Exchange(ref state.WatchdogCaseBLastFileSize, 0);
+            // Don't reset WatchdogCaseBLastFileSize to 0 — keep the last known file size
+            // so when Case B first triggers after events stop, prevSize > 0 and the stale
+            // detection works on the first iteration instead of wasting a 180s cycle.
             Interlocked.Exchange(ref state.WatchdogCaseBStaleCount, 0);
             // Clear the reconnect flag — event stream is alive for this session.
             state.IsReconnectedSend = false;
@@ -645,23 +649,7 @@ public partial class CopilotService
                 // SDK never sends a clean idle after background tasks finish (observed in multi-agent groups).
                 if (HasActiveBackgroundTasks(idle))
                 {
-                    // Track when we first started deferring
-                    var firstDefer = Interlocked.Read(ref state.FirstIdleDeferAtTicks);
-                    if (firstDefer == 0)
-                        Interlocked.CompareExchange(ref state.FirstIdleDeferAtTicks, DateTime.UtcNow.Ticks, 0);
-                    else
-                    {
-                        var deferredSeconds = (DateTime.UtcNow - new DateTime(firstDefer)).TotalSeconds;
-                        if (deferredSeconds >= BackgroundTaskIdleMaxDeferSeconds)
-                        {
-                            Debug($"[IDLE-DEFER-FORCE] '{sessionName}' background tasks deferred for {deferredSeconds:F0}s " +
-                                  $"(max={BackgroundTaskIdleMaxDeferSeconds}s) — force-completing to prevent orchestrator hang");
-                            Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
-                            CancelIdleDeferFallback(state);
-                            goto forceComplete;
-                        }
-                    }
-
+                    state.HasDeferredIdle = true; // Track for watchdog freshness window
                     Debug($"[IDLE-DEFER] '{sessionName}' session.idle received with active background tasks — " +
                           $"deferring completion (IsProcessing={state.Info.IsProcessing}, " +
                           $"response={state.CurrentResponse.Length}+{state.FlushedResponse.Length} chars)");
@@ -811,6 +799,7 @@ public partial class CopilotService
                 CancelIdleDeferFallback(state);
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                 Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -819,6 +808,12 @@ public partial class CopilotService
                 {
                     if (state.IsOrphaned) return;
                     OnError?.Invoke(sessionName, errMsg);
+                    // Surface auth errors as a dismissible banner
+                    if (IsAuthError(err.Data?.Message ?? ""))
+                    {
+                        AuthNotice = "Not authenticated — run the login command below, then click Re-authenticate.";
+                        StartAuthPolling();
+                    }
                     // Flush any accumulated partial response before clearing the accumulator
                     FlushCurrentResponse(state);
                     state.FlushedResponse.Clear();
@@ -857,7 +852,109 @@ public partial class CopilotService
                     Invoke(() => OnStateChanged?.Invoke());
                 }
                 break;
-                
+
+            // ──────────────────────────────────────────────────────────────────────
+            // Subagent lifecycle: the CLI can automatically select specialized agents
+            // (e.g. code-review, security-review) when processing a prompt.
+            // Show these in chat so the user knows which agent is active.
+            // ──────────────────────────────────────────────────────────────────────
+            case SubagentSelectedEvent subagentSelected:
+            {
+                var d = subagentSelected.Data;
+                var displayName = !string.IsNullOrEmpty(d?.AgentDisplayName) ? d.AgentDisplayName : d?.AgentName;
+                if (!string.IsNullOrEmpty(displayName))
+                {
+                    Invoke(() =>
+                    {
+                        state.Info.ActiveAgentName = d!.AgentName;
+                        state.Info.ActiveAgentDisplayName = displayName;
+                        state.Info.History.Add(ChatMessage.SystemMessage($"🤖 Agent: **{displayName}**"));
+                        NotifyStateChangedCoalesced();
+                    });
+                }
+                break;
+            }
+
+            case SubagentDeselectedEvent:
+                Invoke(() =>
+                {
+                    state.Info.ActiveAgentName = null;
+                    state.Info.ActiveAgentDisplayName = null;
+                    NotifyStateChangedCoalesced();
+                });
+                break;
+
+            case SubagentStartedEvent subagentStarted:
+            {
+                var d = subagentStarted.Data;
+                var displayName = !string.IsNullOrEmpty(d?.AgentDisplayName) ? d.AgentDisplayName : d?.AgentName;
+                if (!string.IsNullOrEmpty(displayName))
+                {
+                    var desc = !string.IsNullOrEmpty(d?.AgentDescription) ? $" — {d.AgentDescription}" : "";
+                    Invoke(() =>
+                    {
+                        state.Info.History.Add(ChatMessage.SystemMessage($"▶️ Starting agent: **{displayName}**{desc}"));
+                        NotifyStateChangedCoalesced();
+                    });
+                }
+                break;
+            }
+
+            case SubagentCompletedEvent subagentCompleted:
+            {
+                var d = subagentCompleted.Data;
+                var displayName = !string.IsNullOrEmpty(d?.AgentDisplayName) ? d.AgentDisplayName : d?.AgentName;
+                Invoke(() =>
+                {
+                    if (!string.IsNullOrEmpty(displayName))
+                        state.Info.History.Add(ChatMessage.SystemMessage($"✅ Agent completed: **{displayName}**"));
+                    // Always clear active agent state — even if displayName is empty
+                    if (d?.AgentName == null || string.Equals(state.Info.ActiveAgentName, d.AgentName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        state.Info.ActiveAgentName = null;
+                        state.Info.ActiveAgentDisplayName = null;
+                    }
+                    NotifyStateChangedCoalesced();
+                });
+                break;
+            }
+
+            case SubagentFailedEvent subagentFailed:
+            {
+                var d = subagentFailed.Data;
+                var displayName = !string.IsNullOrEmpty(d?.AgentDisplayName) ? d.AgentDisplayName : d?.AgentName;
+                var errDetail = !string.IsNullOrEmpty(d?.Error) ? $": {d.Error}" : "";
+                Invoke(() =>
+                {
+                    if (!string.IsNullOrEmpty(displayName))
+                        state.Info.History.Add(ChatMessage.ErrorMessage($"Agent failed: **{displayName}**{errDetail}"));
+                    // Always clear active agent state — even if displayName is empty
+                    if (d?.AgentName == null || string.Equals(state.Info.ActiveAgentName, d.AgentName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        state.Info.ActiveAgentName = null;
+                        state.Info.ActiveAgentDisplayName = null;
+                    }
+                    NotifyStateChangedCoalesced();
+                });
+                break;
+            }
+
+            case SkillInvokedEvent skillInvoked:
+            {
+                var skillName = skillInvoked.Data?.Name;
+                var pluginName = skillInvoked.Data?.PluginName;
+                var label = !string.IsNullOrEmpty(pluginName) ? $"{skillName} ({pluginName})" : skillName;
+                if (!string.IsNullOrEmpty(label))
+                {
+                    Invoke(() =>
+                    {
+                        state.Info.History.Add(ChatMessage.SystemMessage($"⚡ Skill: **{label}**"));
+                        NotifyStateChangedCoalesced();
+                    });
+                }
+                break;
+            }
+
             default:
                 LogUnhandledSessionEvent(sessionName, evt);
                 break;
@@ -1062,6 +1159,7 @@ public partial class CopilotService
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         Interlocked.Exchange(ref state.FirstIdleDeferAtTicks, 0);
         state.HasUsedToolsThisTurn = false;
+        state.HasDeferredIdle = false;
         state.IsReconnectedSend = false; // Clear reconnect flag on turn completion (defense-in-depth)
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
@@ -1131,6 +1229,11 @@ public partial class CopilotService
         var summary = fullResponse.Length > 0 ? (fullResponse.Length > 100 ? fullResponse[..100] + "..." : fullResponse) : "";
         OnSessionComplete?.Invoke(state.Info.Name, summary);
         OnStateChanged?.Invoke();
+
+        // Safety net: if this is an orchestrator whose response contains @worker blocks
+        // but was sent via SendPromptAsync (not the multi-agent pipeline), dispatch them.
+        // This catches routing bypasses where SendToMultiAgentGroupAsync was skipped.
+        TryDispatchOrphanedOrchestratorResponse(state.Info.Name, fullResponse);
 
         // Reflection cycle: evaluate response and enqueue follow-up if goal not yet met
         var cycle = state.Info.ReflectionCycle;
@@ -1230,8 +1333,17 @@ public partial class CopilotService
                             {
                                 if (orchGroupId != null && nextImagePaths is null or { Count: 0 })
                                 {
-                                    Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
-                                    await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                                    // If a reflect loop is active, queue for its next iteration boundary
+                                    // instead of starting a competing loop via SendToMultiAgentGroupAsync.
+                                    if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt))
+                                    {
+                                        Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
+                                        await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                                    }
+                                    else
+                                    {
+                                        Debug($"[DISPATCH] Queue drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId}'");
+                                    }
                                 }
                                 else
                                 {
@@ -1250,8 +1362,15 @@ public partial class CopilotService
                     {
                         if (orchGroupId != null && nextImagePaths is null or { Count: 0 })
                         {
-                            Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
-                            await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                            if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt))
+                            {
+                                Debug($"[DISPATCH] Queue drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId}'");
+                                await SendToMultiAgentGroupAsync(orchGroupId, nextPrompt);
+                            }
+                            else
+                            {
+                                Debug($"[DISPATCH] Queue drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId}'");
+                            }
                         }
                         else
                         {
@@ -1441,7 +1560,7 @@ public partial class CopilotService
                 var ctxPct = (double)state.Info.ContextCurrentTokens.Value / state.Info.ContextTokenLimit.Value;
                 if (ctxPct > 0.9)
                 {
-                    var ctxWarning = ChatMessage.SystemMessage($"🔴 Context {ctxPct:P0} full — reflection may lose earlier history. Consider `/reflect stop`.");
+                    var ctxWarning = ChatMessage.SystemMessage($"🔴 Context {ctxPct:P0} full — reflection may lose earlier history.");
                     state.Info.History.Add(ctxWarning);
                     state.Info.MessageCount = state.Info.History.Count;
                     if (!string.IsNullOrEmpty(state.Info.SessionId))
@@ -1513,6 +1632,9 @@ public partial class CopilotService
                     var skipHistory = state.Info.ReflectionCycle is { IsActive: true } &&
                                       ReflectionCycle.IsReflectionFollowUpPrompt(nextPrompt2);
 
+                    // Check if this is an orchestrator — route through multi-agent pipeline
+                    var orchGroupId2 = GetOrchestratorGroupId(state.Info.Name);
+
                     _ = Task.Run(async () =>
                     {
                         try
@@ -1525,7 +1647,22 @@ public partial class CopilotService
                                 {
                                     try
                                     {
-                                        await SendPromptAsync(state.Info.Name, nextPrompt2, skipHistoryMessage: skipHistory, agentMode: nextAgentMode2);
+                                        if (orchGroupId2 != null)
+                                        {
+                                            if (!TryQueueForActiveReflectLoop(state.Info.Name, nextPrompt2))
+                                            {
+                                                Debug($"[DISPATCH] Evaluator drain routing to multi-agent pipeline: session='{state.Info.Name}', group='{orchGroupId2}'");
+                                                await SendToMultiAgentGroupAsync(orchGroupId2, nextPrompt2);
+                                            }
+                                            else
+                                            {
+                                                Debug($"[DISPATCH] Evaluator drain deferred to active reflect loop: session='{state.Info.Name}', group='{orchGroupId2}'");
+                                            }
+                                        }
+                                        else
+                                        {
+                                            await SendPromptAsync(state.Info.Name, nextPrompt2, skipHistoryMessage: skipHistory, agentMode: nextAgentMode2);
+                                        }
                                         tcs.TrySetResult();
                                     }
                                     catch (Exception ex)
@@ -1862,6 +1999,7 @@ public partial class CopilotService
             // Full cleanup mirroring CompleteResponse — missing fields here caused stuck sessions
             Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
             state.HasUsedToolsThisTurn = false;
+            state.HasDeferredIdle = false;
             state.FallbackCanceledByTurnStart = false;
             Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
             Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
@@ -1908,6 +2046,16 @@ public partial class CopilotService
     {
         var prev = Interlocked.Exchange(ref state.TurnEndIdleCts, null);
         prev?.Cancel();
+        prev?.Dispose();
+    }
+
+    /// <summary>
+    /// Cancels the IDLE-DEFER fallback timer to prevent stale force-completion
+    /// after normal completion or a new turn has started.
+    /// </summary>
+    private static void CancelIdleDeferFallback(SessionState state)
+    {
+        var prev = Interlocked.Exchange(ref state.IdleDeferFallbackTimer, null);
         prev?.Dispose();
     }
 
@@ -2039,7 +2187,15 @@ public partial class CopilotService
                 await Task.Delay(TimeSpan.FromSeconds(WatchdogCheckIntervalSeconds), ct);
 
                 if (!state.Info.IsProcessing) break;
-                if (state.IsOrphaned) { Debug($"[WATCHDOG] '{sessionName}' exiting — state is orphaned"); return; }
+                if (state.IsOrphaned)
+                {
+                    Debug($"[WATCHDOG] '{sessionName}' exiting — state is orphaned, resolving TCS to unblock callers");
+                    state.Info.IsProcessing = false;
+                    state.Info.ProcessingStartedAt = null;
+                    state.ResponseCompletion?.TrySetCanceled();
+                    OnSessionComplete?.Invoke(sessionName, "(orphaned)");
+                    return;
+                }
 
                 var lastEventTicks = Interlocked.Read(ref state.LastEventAtTicks);
                 var elapsed = (DateTime.UtcNow - new DateTime(lastEventTicks)).TotalSeconds;
@@ -2260,7 +2416,7 @@ public partial class CopilotService
                                 // - "after turn start" alone stays true forever once any event is written
                                 // - "recent" alone could match stale files from a previous turn
                                 var caseBEventsActive = false;
-                                var freshnessSeconds = isMultiAgentSession
+                                var freshnessSeconds = (isMultiAgentSession || state.HasDeferredIdle)
                                     ? WatchdogMultiAgentCaseBFreshnessSeconds
                                     : WatchdogCaseBFreshnessSeconds;
                                 try
@@ -2435,6 +2591,7 @@ public partial class CopilotService
                         CancelToolHealthCheck(state);
                         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                         state.HasUsedToolsThisTurn = false;
+                        state.HasDeferredIdle = false;
                         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                         Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                         Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -2472,7 +2629,11 @@ public partial class CopilotService
                             Debug($"[SERVER-RECOVERY] {serviceTimeouts} consecutive watchdog timeouts — triggering persistent server recovery");
                             _ = Task.Run(async () =>
                             {
-                                try { await TryRecoverPersistentServerAsync(); }
+                                try
+                                {
+                                    var recovered = await TryRecoverPersistentServerAsync();
+                                    if (recovered) _ = CheckAuthStatusAsync();
+                                }
                                 catch (Exception recoverEx) { Debug($"[SERVER-RECOVERY] Background recovery failed: {recoverEx.Message}"); }
                             });
                         }
@@ -2531,6 +2692,7 @@ public partial class CopilotService
                     Interlocked.Exchange(ref state.SendingFlag, 0);
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
+                    state.HasDeferredIdle = false;
                     Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
                     Interlocked.Exchange(ref state.EventCountThisTurn, 0);
@@ -2586,6 +2748,7 @@ public partial class CopilotService
             state.Info.IsProcessing = false;
             state.Info.IsResumed = false;
             state.HasUsedToolsThisTurn = false;
+            state.HasDeferredIdle = false;
             Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
             Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
             Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);
@@ -2684,6 +2847,7 @@ public partial class CopilotService
             Interlocked.Exchange(ref state.SendingFlag, 0);
             // Clear stale tool flag so watchdog uses normal timeout if resend is skipped
             newState.HasUsedToolsThisTurn = false;
+            newState.HasDeferredIdle = false;
 
             // Replace in sessions dictionary BEFORE registering event handler
             // so HandleSessionEvent's isCurrentState check passes for the new state.
@@ -2721,6 +2885,7 @@ public partial class CopilotService
                 state.Info.IsProcessing = false;
                 state.Info.IsResumed = false;
                 state.HasUsedToolsThisTurn = false;
+                state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 Interlocked.Exchange(ref state.ToolHealthStaleChecks, 0);

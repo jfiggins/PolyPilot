@@ -37,8 +37,22 @@ public class ServerManager : IServerManager
         try
         {
             using var client = new TcpClient();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
-            client.ConnectAsync(host, port.Value, cts.Token).AsTask().GetAwaiter().GetResult();
+            // Use Task.WaitAny with a timeout task instead of CancellationTokenSource.
+            // CancellationTokenSource disposal while ConnectAsync is still running its
+            // internal cleanup can produce unobserved ObjectDisposedException tasks.
+            var connectTask = client.ConnectAsync(host, port.Value);
+            int index = Task.WaitAny(new[] { connectTask }, TimeSpan.FromSeconds(1));
+            if (index == -1)
+            {
+                // Timed out — observe any future exception (Faulted or Cancelled) to prevent
+                // unobserved task exceptions. NotOnRanToCompletion covers both Faulted and
+                // Cancelled states; OnlyOnFaulted would miss Cancelled (which can occur if the
+                // TcpClient is disposed while the connect is still in-flight).
+                _ = connectTask.ContinueWith(t => { _ = t.Exception; },
+                    TaskContinuationOptions.NotOnRanToCompletion);
+                return false;
+            }
+            connectTask.GetAwaiter().GetResult();
             return true;
         }
         catch
@@ -50,7 +64,7 @@ public class ServerManager : IServerManager
     /// <summary>
     /// Start copilot in headless server mode, detached from app lifecycle
     /// </summary>
-    public async Task<bool> StartServerAsync(int port = 4321)
+    public async Task<bool> StartServerAsync(int port = 4321, string? githubToken = null)
     {
         ServerPort = port;
         LastError = null;
@@ -75,6 +89,16 @@ public class ServerManager : IServerManager
                 RedirectStandardError = true,
                 RedirectStandardInput = false
             };
+
+            // Forward the GitHub token via environment variable so the headless server
+            // can authenticate even when the macOS Keychain is inaccessible (e.g., the
+            // Keychain entry was created in a terminal session and the ACL dialog can't
+            // be shown for a background process).
+            if (!string.IsNullOrEmpty(githubToken))
+            {
+                psi.Environment["COPILOT_GITHUB_TOKEN"] = githubToken;
+                Console.WriteLine("[ServerManager] Passing COPILOT_GITHUB_TOKEN to headless server");
+            }
 
             // Use ArgumentList for proper escaping (especially MCP JSON)
             psi.ArgumentList.Add("--headless");
@@ -156,8 +180,7 @@ public class ServerManager : IServerManager
             try
             {
                 var process = Process.GetProcessById(pid.Value);
-                process.Kill();
-                process.Dispose();
+                ProcessHelper.SafeKillAndDispose(process, entireProcessTree: false);
                 Console.WriteLine($"[ServerManager] Killed server PID {pid}");
             }
             catch (Exception ex)

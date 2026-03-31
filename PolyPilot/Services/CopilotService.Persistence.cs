@@ -403,21 +403,66 @@ public partial class CopilotService
             state.Session = copilotSession;
             state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName);
 
-            // If we resumed a session that crashed mid-tool-execution, the SDK is stuck
-            // waiting for tool results that will never arrive. It silently queues/ignores
-            // new SendAsync calls until the pending tools are resolved. An explicit abort
-            // clears this state and allows new messages to flow.
+            // After resume, if events.jsonl shows unmatched tool_execution_start events,
+            // the CLI was mid-tool when PolyPilot last connected. In persistent mode the
+            // headless server keeps running tools even while PolyPilot is down — the results
+            // WILL arrive once we reconnect. Never abort on resume; instead mark as processing
+            // and let the watchdog handle truly dead sessions via timeout (30-600s depending
+            // on state). This avoids killing legitimate long-running tool executions that can
+            // run 15-30+ minutes without writing to events.jsonl.
             if (wasResumed && HasInterruptedToolExecution(sessionId))
             {
-                Debug($"[RESUME-ABORT] '{sessionName}' has interrupted tool execution — sending abort to clear pending state");
-                try
+                // Use CLI liveness to choose watchdog tier — never abort in either case.
+                // INV-2: marshal to UI thread — EnsureSessionConnectedAsync runs from Task.Run.
+                // INV-3/INV-12: capture generation to prevent stale callback from re-arming
+                // IsProcessing after a user-initiated turn has already completed.
+                bool cliStillActive = IsSessionStillProcessing(sessionId);
+                var gen = Interlocked.Read(ref state.ProcessingGeneration);
+
+                if (cliStillActive)
                 {
-                    await copilotSession.AbortAsync(cancellationToken);
-                    Debug($"[RESUME-ABORT] '{sessionName}' abort sent successfully");
+                    Debug($"[RESUME-ACTIVE] '{sessionName}' has unmatched tool starts and CLI is alive — 600s tool timeout");
+                    InvokeOnUI(() =>
+                    {
+                        if (Interlocked.Read(ref state.ProcessingGeneration) != gen) return;
+                        state.Info.IsProcessing = true;
+                        state.Info.IsResumed = true;
+                        state.HasUsedToolsThisTurn = true;
+                        state.Info.ProcessingPhase = 3; // Working
+                        state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                        StartProcessingWatchdog(state, sessionName);
+                        NotifyStateChanged();
+                    });
                 }
-                catch (Exception abortEx)
+                else
                 {
-                    Debug($"[RESUME-ABORT] '{sessionName}' abort failed (non-fatal): {abortEx.Message}");
+                    Debug($"[RESUME-QUIESCE] '{sessionName}' has unmatched tool starts but CLI is stale — clearing SDK tool state + 30s quiescence timeout");
+                    // CLI is dead — clear SDK-internal pending tool expectations so future
+                    // SendAsync calls aren't silently dropped. This is safe because the CLI
+                    // won't be delivering those tool results anyway.
+                    try
+                    {
+                        await copilotSession.AbortAsync(cancellationToken);
+                        Debug($"[RESUME-QUIESCE] '{sessionName}' abort sent to clear pending tool state");
+                    }
+                    catch (Exception abortEx)
+                    {
+                        Debug($"[RESUME-QUIESCE] '{sessionName}' abort failed (non-fatal): {abortEx.Message}");
+                    }
+                    InvokeOnUI(() =>
+                    {
+                        if (Interlocked.Read(ref state.ProcessingGeneration) != gen) return;
+                        state.Info.IsProcessing = true;
+                        state.Info.IsResumed = true;
+                        // Reset in case AbortAsync triggered an SDK event on a background thread
+                        // that set this to true — would defeat the 30s quiescence check.
+                        Volatile.Write(ref state.HasReceivedEventsSinceResume, false);
+                        // Do NOT set HasUsedToolsThisTurn — lets watchdog use 30s resume quiescence
+                        state.Info.ProcessingPhase = 3; // Working
+                        state.Info.ProcessingStartedAt = DateTime.UtcNow;
+                        StartProcessingWatchdog(state, sessionName);
+                        NotifyStateChanged();
+                    });
                 }
             }
 
@@ -601,10 +646,16 @@ public partial class CopilotService
                             _sessions[entry.DisplayName] = lazyState;
                             _activeSessionName ??= entry.DisplayName;
                             RestoreUsageStats(entry);
-                            if (!string.IsNullOrWhiteSpace(entry.LastPrompt))
+                            // Eagerly resume sessions that are still actively processing on the
+                            // headless server. Check events.jsonl (authoritative) first, then fall
+                            // back to LastPrompt (saved when IsProcessing=true at debounce time).
+                            // Without this, actively-running sessions appear idle after app restart
+                            // because they're only loaded as lazy placeholders with no SDK connection.
+                            var isStillActive = IsSessionStillProcessing(entry.SessionId);
+                            if (isStillActive || !string.IsNullOrWhiteSpace(entry.LastPrompt))
                             {
                                 eagerResumeCandidates.Add((entry.DisplayName, lazyState));
-                                Debug($"Queued eager resume for interrupted session: {entry.DisplayName}");
+                                Debug($"Queued eager resume for interrupted session: {entry.DisplayName} (active={isStillActive}, hasLastPrompt={!string.IsNullOrWhiteSpace(entry.LastPrompt)})");
                             }
                             Debug($"Loaded session placeholder: {entry.DisplayName} ({lazyHistory.Count} messages)");
                         }
@@ -746,7 +797,7 @@ public partial class CopilotService
 
     }
 
-    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null)
+    public void SaveUiState(string currentPage, string? activeSession = null, int? fontSize = null, string? selectedModel = null, bool? expandedGrid = null, string? expandedSession = "<<unspecified>>", Dictionary<string, string>? inputModes = null, int? gridColumns = null, int? cardMinHeight = null, Dictionary<string, string>? drafts = null)
     {
         try
         {
@@ -767,6 +818,9 @@ public partial class CopilotService
                 CompletedTutorials = existing?.CompletedTutorials ?? new HashSet<string>(),
                 GridColumns = gridColumns ?? existing?.GridColumns ?? 3,
                 CardMinHeight = cardMinHeight ?? existing?.CardMinHeight ?? 250,
+                Drafts = drafts != null
+                    ? new Dictionary<string, string>(drafts)
+                    : existing?.Drafts ?? new Dictionary<string, string>(),
             };
 
             lock (_uiStateLock)
@@ -779,6 +833,29 @@ public partial class CopilotService
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to prepare UI state: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Saves draft text and immediately flushes to disk (no debounce).
+    /// Called before auto-update relaunch to ensure drafts survive the restart.
+    /// </summary>
+    public void SaveDraftsImmediate(Dictionary<string, string> drafts)
+    {
+        try
+        {
+            Directory.CreateDirectory(PolyPilotBaseDir);
+            var existing = LoadUiState() ?? new UiState();
+            existing.Drafts = new Dictionary<string, string>(drafts);
+            lock (_uiStateLock)
+            {
+                _pendingUiState = existing;
+            }
+            FlushUiState();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to save drafts: {ex.Message}");
         }
     }
 

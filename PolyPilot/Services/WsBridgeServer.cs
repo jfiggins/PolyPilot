@@ -25,6 +25,7 @@ public class WsBridgeServer : IDisposable
     private RepoManager? _repoManager;
     private readonly ConcurrentDictionary<string, WebSocket> _clients = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _clientSendLocks = new();
+    private long _lastPairRequestAcceptedAtTicks = DateTime.MinValue.Ticks;
 
     // Debounce timers to prevent flooding mobile clients during streaming
     private Timer? _sessionsListDebounce;
@@ -72,67 +73,44 @@ public class WsBridgeServer : IDisposable
         {
             if (IsRunning) return; // Re-check now that we hold the guard.
 
-            _bridgePort = bridgePort;
-            _cts = new CancellationTokenSource();
+        if (TryBindListener(bridgePort))
+        {
+            _acceptTask = AcceptLoopAsync(_cts.Token);
+            OnStateChanged?.Invoke();
+        }
+        else
+        {
+            // Port likely in TIME_WAIT from a previous instance (relaunch).
+            // Start the accept loop anyway — it will retry via TryRestartListenerAsync
+            // with exponential backoff until the port is released (typically 5-15s).
+            Console.WriteLine($"[WsBridge] Port {bridgePort} busy — will retry in accept loop");
+            _acceptTask = AcceptLoopAsync(_cts.Token);
+        }
+    }
 
-            if (!LocalhostOnly)
-            {
-                _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://+:{bridgePort}/");
-
-                try
-                {
-                    _listener.Start();
-                    Console.WriteLine($"[WsBridge] Listening on port {bridgePort} (state-sync mode)");
-                    _acceptTask = AcceptLoopAsync(_cts.Token);
-                    OnStateChanged?.Invoke();
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[WsBridge] Failed to start on wildcard: {ex.Message}");
-
-                    // On Windows, wildcard binding requires a URL ACL reservation.
-                    // Attempt to register one automatically so LAN/mobile connections work.
-                    if (OperatingSystem.IsWindows() && TryRegisterUrlAcl(bridgePort))
-                    {
-                        try
-                        {
-                            _listener = new HttpListener();
-                            _listener.Prefixes.Add($"http://+:{bridgePort}/");
-                            _listener.Start();
-                            Console.WriteLine($"[WsBridge] Listening on port {bridgePort} after URL ACL registration (state-sync mode)");
-                            _acceptTask = AcceptLoopAsync(_cts.Token);
-                            OnStateChanged?.Invoke();
-                            return;
-                        }
-                        catch (Exception ex3)
-                        {
-                            Console.WriteLine($"[WsBridge] Wildcard still failed after URL ACL: {ex3.Message}");
-                        }
-                    }
-                }
-            }
-
-            // Localhost-only fallback (also used when LocalhostOnly is set)
+    /// <summary>
+    /// Try to bind the HttpListener on the given port. Tries wildcard first (LAN access),
+    /// falls back to localhost. Returns true if the listener is now listening.
+    /// </summary>
+    private bool TryBindListener(int port)
+    {
+        foreach (var prefix in new[] { $"http://+:{port}/", $"http://localhost:{port}/" })
+        {
             try
             {
-                _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://localhost:{bridgePort}/");
-                _listener.Start();
-                Console.WriteLine($"[WsBridge] Listening on localhost:{bridgePort} (state-sync mode){(LocalhostOnly ? "" : " — LAN/mobile connections will NOT work")}");
-                _acceptTask = AcceptLoopAsync(_cts.Token);
-                OnStateChanged?.Invoke();
+                var listener = new HttpListener();
+                listener.Prefixes.Add(prefix);
+                listener.Start();
+                _listener = listener;
+                Console.WriteLine($"[WsBridge] Listening on port {port} (state-sync mode)");
+                return true;
             }
-            catch (Exception ex2)
+            catch (Exception ex)
             {
-                Console.WriteLine($"[WsBridge] Failed to start on localhost: {ex2.Message}");
+                Console.WriteLine($"[WsBridge] Bind on {prefix} failed: {ex.Message}");
             }
         }
-        finally
-        {
-            Interlocked.Exchange(ref _startGuard, 0);
-        }
+        return false;
     }
 
     // Track ports where ACL registration has already been attempted this session.
@@ -291,8 +269,16 @@ public class WsBridgeServer : IDisposable
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.TurnStart,
                 new SessionNamePayload { SessionName = session }));
         _copilot.OnTurnEnd += (session) =>
+        {
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.TurnEnd,
                 new SessionNamePayload { SessionName = session }));
+            // Push updated history to all clients after each sub-turn flush.
+            // FlushCurrentResponse runs before OnTurnEnd, so History is up-to-date.
+            // Without this, mobile only has content_delta-built messages — if any
+            // deltas were missed (WS buffering, timing), the text is permanently lost
+            // until the user manually requests a history sync.
+            _ = BroadcastSessionHistoryAsync(session);
+        };
         _copilot.OnSessionComplete += (session, summary) =>
         {
             Broadcast(BridgeMessage.Create(BridgeMessageTypes.SessionComplete,
@@ -361,7 +347,25 @@ public class WsBridgeServer : IDisposable
             {
                 var context = await _listener!.GetContextAsync();
 
-                if (context.Request.IsWebSocketRequest)
+                if (context.Request.IsWebSocketRequest &&
+                    context.Request.Url?.AbsolutePath == "/pair")
+                {
+                    // Unauthenticated pairing handshake path — rate-limited at HTTP level
+                    // Use Interlocked.CompareExchange to atomically claim the slot, preventing TOCTOU races.
+                    var nowTicks = DateTime.UtcNow.Ticks;
+                    var lastTicks = Interlocked.Read(ref _lastPairRequestAcceptedAtTicks);
+                    var elapsed = TimeSpan.FromTicks(nowTicks - lastTicks);
+                    if (elapsed.TotalSeconds < 5 ||
+                        Interlocked.CompareExchange(ref _lastPairRequestAcceptedAtTicks, nowTicks, lastTicks) != lastTicks)
+                    {
+                        context.Response.StatusCode = 429;
+                        context.Response.Close();
+                        Console.WriteLine("[WsBridge] Pair request rate-limited");
+                        continue;
+                    }
+                    _ = Task.Run(() => HandlePairHandshakeAsync(context, ct), ct);
+                }
+                else if (context.Request.IsWebSocketRequest)
                 {
                     if (!ValidateClientToken(context.Request))
                     {
@@ -433,26 +437,15 @@ public class WsBridgeServer : IDisposable
         try { _listener?.Stop(); } catch { }
         _listener = null;
 
-        // Brief pause so the OS has time to release the port after a crash.
-        try { await Task.Delay(500, ct); } catch (OperationCanceledException) { return false; }
+        // Wait for the OS to release the port after the old process died.
+        // macOS TIME_WAIT can hold the port for several seconds after kill.
+        try { await Task.Delay(2000, ct); } catch (OperationCanceledException) { return false; }
 
-        // Try wildcard binding first (allows LAN / Tailscale access).
-        foreach (var prefix in new[] { $"http://+:{_bridgePort}/", $"http://localhost:{_bridgePort}/" })
+        if (TryBindListener(_bridgePort))
         {
-            try
-            {
-                var listener = new HttpListener();
-                listener.Prefixes.Add(prefix);
-                listener.Start();
-                _listener = listener;
-                Console.WriteLine($"[WsBridge] Restarted listening on {prefix}");
-                OnStateChanged?.Invoke();
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[WsBridge] Restart on {prefix} failed: {ex.Message}");
-            }
+            Console.WriteLine($"[WsBridge] Restarted listening on port {_bridgePort}");
+            OnStateChanged?.Invoke();
+            return true;
         }
         return false;
     }
@@ -581,6 +574,12 @@ public class WsBridgeServer : IDisposable
                 if (result.MessageType == WebSocketMessageType.Close) break;
 
                 messageBuffer.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+
+                if (messageBuffer.Length > 256 * 1024)
+                {
+                    try { await ws.CloseAsync(WebSocketCloseStatus.MessageTooBig, "Message exceeds 256KB limit", CancellationToken.None); } catch { }
+                    break; // guard against unbounded frames
+                }
 
                 if (result.EndOfMessage)
                 {
@@ -763,7 +762,11 @@ public class WsBridgeServer : IDisposable
                     if (abortReq != null && !string.IsNullOrWhiteSpace(abortReq.SessionName))
                     {
                         Console.WriteLine($"[WsBridge] Client aborting session '{abortReq.SessionName}'");
-                        await _copilot.AbortSessionAsync(abortReq.SessionName);
+                        // AbortSessionAsync mutates IsProcessing/History — must run on UI thread
+                        _copilot.InvokeOnUI(() =>
+                        {
+                            _ = _copilot.AbortSessionAsync(abortReq.SessionName);
+                        });
                     }
                     break;
 
@@ -1338,6 +1341,83 @@ public class WsBridgeServer : IDisposable
         Broadcast(msg);
     }
 
+    /// <summary>
+    /// Push the current session history to all connected clients.
+    /// Called after FlushCurrentResponse on each sub-turn end so mobile clients
+    /// have authoritative history even if content_delta events were missed.
+    /// </summary>
+    private async Task BroadcastSessionHistoryAsync(string sessionName)
+    {
+        try
+        {
+            if (_copilot == null || _clients.IsEmpty) return;
+
+            var session = _copilot.GetSession(sessionName);
+            if (session == null) return;
+
+        ChatMessage[] snapshot;
+        lock (session.HistoryLock)
+        {
+            snapshot = session.History.ToArray();
+        }
+
+        var totalCount = snapshot.Length;
+        List<ChatMessage> messagesToSend;
+        bool hasMore;
+        if (totalCount > CopilotService.HistoryLimitForBridge)
+        {
+            messagesToSend = snapshot.Skip(totalCount - CopilotService.HistoryLimitForBridge).ToList();
+            hasMore = true;
+        }
+        else
+        {
+            messagesToSend = snapshot.ToList();
+            hasMore = false;
+        }
+
+        // Populate ImageDataUri for Image messages — clone to avoid mutating shared History objects
+        for (int i = 0; i < messagesToSend.Count; i++)
+        {
+            var m = messagesToSend[i];
+            if (m.MessageType == ChatMessageType.Image && string.IsNullOrEmpty(m.ImageDataUri) && !string.IsNullOrEmpty(m.ImagePath))
+            {
+                try
+                {
+                    if (File.Exists(m.ImagePath))
+                    {
+                        var bytes = await File.ReadAllBytesAsync(m.ImagePath);
+                        var clone = new ChatMessage(m.Role, m.Content, m.Timestamp, m.MessageType)
+                        {
+                            ImagePath = m.ImagePath,
+                            Caption = m.Caption,
+                            ToolCallId = m.ToolCallId,
+                            ToolName = m.ToolName,
+                            IsComplete = m.IsComplete,
+                            IsSuccess = m.IsSuccess,
+                            ImageDataUri = $"data:{ImageMimeType(m.ImagePath)};base64,{Convert.ToBase64String(bytes)}"
+                        };
+                        messagesToSend[i] = clone;
+                    }
+                }
+                catch { /* best effort */ }
+            }
+        }
+
+        var payload = new SessionHistoryPayload
+        {
+            SessionName = sessionName,
+            Messages = messagesToSend,
+            TotalCount = totalCount,
+            HasMore = hasMore
+        };
+        Broadcast(BridgeMessage.Create(BridgeMessageTypes.SessionHistory, payload));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] BroadcastSessionHistory error for '{sessionName}': {ex.Message}");
+        }
+    }
+
     private async Task HandleOrganizationCommandAsync(OrganizationCommandPayload cmd)
     {
         if (_copilot == null) return;
@@ -1536,4 +1616,31 @@ public class WsBridgeServer : IDisposable
         ".tiff" => "image/tiff",
         _ => "image/png"
     };
+
+    private async Task HandlePairHandshakeAsync(HttpListenerContext ctx, CancellationToken ct)
+    {
+        WebSocket? ws = null;
+        try
+        {
+            var wsCtx = await ctx.AcceptWebSocketAsync(null);
+            ws = wsCtx.WebSocket;
+            var remoteIp = ctx.Request.RemoteEndPoint?.Address.ToString() ?? "unknown";
+            Console.WriteLine($"[WsBridge] Pair handshake from {remoteIp}");
+
+            if (_fiestaService != null)
+                await _fiestaService.HandleIncomingPairHandshakeAsync(ws, remoteIp, ct);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WsBridge] Pair handshake error: {ex.Message}");
+        }
+        finally
+        {
+            if (ws?.State == WebSocketState.Open)
+            {
+                try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None); }
+                catch { }
+            }
+        }
+    }
 }

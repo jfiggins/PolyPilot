@@ -87,20 +87,7 @@ public partial class CopilotService
         {
             var eventsFile = Path.Combine(SessionStatePath, sessionId, "events.jsonl");
             if (!File.Exists(eventsFile)) return null;
-            foreach (var line in File.ReadLines(eventsFile).Take(5))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                using var doc = JsonDocument.Parse(line);
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("type", out var t) || t.GetString() != "session.start") continue;
-                if (root.TryGetProperty("data", out var data) &&
-                    data.TryGetProperty("selectedModel", out var model))
-                {
-                    var modelStr = model.GetString();
-                    // Normalize display names to slugs
-                    return string.IsNullOrEmpty(modelStr) ? null : Models.ModelHelper.NormalizeToSlug(modelStr);
-                }
-            }
+            return Models.ModelHelper.ExtractLatestModelFromEvents(File.ReadLines(eventsFile));
         }
         catch { }
         return null;
@@ -284,14 +271,14 @@ public partial class CopilotService
             var result = unmatchedStarts > 0 && (sawShutdown || !sawOnlyControlEvents);
             if (result)
             {
-                Debug($"[RESUME-ABORT] events.jsonl for '{sessionId}' has {unmatchedStarts} interrupted tool(s) " +
+                Debug($"[RESUME-CHECK] events.jsonl for '{sessionId}' has {unmatchedStarts} interrupted tool(s) " +
                       $"(shutdown={sawShutdown}, force-kill={!sawShutdown})");
             }
             return result;
         }
         catch (Exception ex)
         {
-            Debug($"[RESUME-ABORT] Failed to check events.jsonl for '{sessionId}': {ex.Message}");
+            Debug($"[RESUME-CHECK] Failed to check events.jsonl for '{sessionId}': {ex.Message}");
             return false;
         }
     }
@@ -507,6 +494,10 @@ public partial class CopilotService
     /// </summary>
     internal static bool IsProcessError(Exception ex)
     {
+        // NOTE: "No process is associated" is an English BCL string from System.Diagnostics.Process.
+        // .NET Core / .NET 5+ does NOT localize exception messages, so this is safe for all
+        // supported runtimes. If .NET ever starts localizing, add a secondary check on the
+        // call stack (e.g., Process.HasExited) or catch the exception at a higher level.
         if (ex is InvalidOperationException && ex.Message.Contains("No process is associated", StringComparison.OrdinalIgnoreCase))
             return true;
         if (ex is AggregateException agg)
@@ -523,11 +514,20 @@ public partial class CopilotService
     /// </summary>
     internal static bool IsAuthError(Exception ex)
     {
-        var msg = ex.Message;
-        if (msg.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
+        if (IsAuthError(ex.Message))
+            return true;
+        if (ex is AggregateException agg)
+            return agg.InnerExceptions.Any(IsAuthError);
+        return ex.InnerException != null && IsAuthError(ex.InnerException);
+    }
+
+    internal static bool IsAuthError(string msg)
+    {
+        return msg.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("not authenticated", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("authentication failed", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("authentication required", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("not created with authentication info", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("token expired", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("token is invalid", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("invalid token", StringComparison.OrdinalIgnoreCase)
@@ -536,11 +536,7 @@ public partial class CopilotService
             || msg.Contains("HTTP 401", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("not authorized", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("bad credentials", StringComparison.OrdinalIgnoreCase)
-            || msg.Contains("login required", StringComparison.OrdinalIgnoreCase))
-            return true;
-        if (ex is AggregateException agg)
-            return agg.InnerExceptions.Any(IsAuthError);
-        return ex.InnerException != null && IsAuthError(ex.InnerException);
+            || msg.Contains("login required", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -845,6 +841,307 @@ public partial class CopilotService
         catch (Exception ex)
         {
             Debug($"Failed to fetch GitHub user info: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Checks the CLI server's authentication status via the SDK and surfaces a
+    /// dismissible banner if the server is not authenticated.
+    /// Returns true if authenticated, false otherwise.
+    ///
+    /// On first auth failure (when no token has been resolved yet), performs a lazy
+    /// full token resolution (including Keychain) and auto-restarts the server.
+    /// This avoids preemptive Keychain reads at startup while still fixing auth
+    /// for users whose headless server can't access the Keychain.
+    /// See .claude/skills/auth-token-safety/SKILL.md (INV-A1, INV-A2).
+    /// </summary>
+    private async Task<bool> CheckAuthStatusAsync()
+    {
+        if (IsDemoMode || IsRemoteMode || _client == null) return false;
+        try
+        {
+            var status = await _client.GetAuthStatusAsync();
+            if (status.IsAuthenticated)
+            {
+                StopAuthPolling();
+                InvokeOnUI(() =>
+                {
+                    AuthNotice = null;
+                    OnStateChanged?.Invoke();
+                });
+                Debug($"[AUTH] Authenticated as {status.Login} via {status.AuthType}");
+                return true;
+            }
+            else
+            {
+                Debug($"[AUTH] Not authenticated: {status.StatusMessage}");
+
+                // Lazy token resolution: if we haven't tried the full chain yet (Keychain + gh),
+                // do it now and auto-restart the server. This handles the case where the headless
+                // server can't access the Keychain on its own (macOS ACL restriction).
+                // SemaphoreSlim(1,1) prevents concurrent callers from both triggering Keychain
+                // dialogs. Loser falls through to StartAuthPolling (correct — next poll retries).
+                // See .claude/skills/auth-token-safety/SKILL.md (INV-A2).
+                if (_resolvedGitHubToken == null && await _tokenResolutionLock.WaitAsync(0))
+                {
+                    try
+                    {
+                        // Double-check after acquiring lock — winner may have set it
+                        if (_resolvedGitHubToken == null)
+                        {
+                            var fullToken = await Task.Run(() => ResolveGitHubTokenForServer());
+                            if (fullToken != null)
+                            {
+                                Debug("[AUTH] Lazy token resolution found a token — restarting server with it");
+                                _resolvedGitHubToken = fullToken;
+                                var recovered = await TryRecoverPersistentServerAsync();
+                                if (recovered)
+                                {
+                                    // Re-check auth after restart
+                                    try
+                                    {
+                                        var recheck = await _client!.GetAuthStatusAsync();
+                                        if (recheck.IsAuthenticated)
+                                        {
+                                            InvokeOnUI(() =>
+                                            {
+                                                AuthNotice = null;
+                                                OnStateChanged?.Invoke();
+                                            });
+                                            Debug($"[AUTH] Authenticated after lazy restart as {recheck.Login}");
+                                            _ = FetchGitHubUserInfoAsync();
+                                            return true;
+                                        }
+                                    }
+                                    catch (Exception recheckEx)
+                                    {
+                                        Debug($"[AUTH] Re-check after lazy restart failed: {recheckEx.Message}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        _tokenResolutionLock.Release();
+                    }
+                }
+
+                InvokeOnUI(() =>
+                {
+                    AuthNotice = "Not authenticated — run the login command below, then click Re-authenticate.";
+                    OnStateChanged?.Invoke();
+                });
+                StartAuthPolling();
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug($"[AUTH] Failed to check auth status: {ex.Message} — scheduling retry");
+            // Treat a thrown exception (server not ready, transient error) as possibly unauthenticated
+            // and start polling so the banner can appear once the server is reachable.
+            StartAuthPolling();
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Starts background polling of auth status every 10s. When auth is detected
+    /// (user completed `copilot login`), automatically restarts the server and clears the banner.
+    /// </summary>
+    private void StartAuthPolling()
+    {
+        lock (_authPollLock)
+        {
+            if (_authPollCts != null) return; // already polling
+            var cts = new CancellationTokenSource();
+            _authPollCts = cts;
+            _ = Task.Run(async () =>
+            {
+                Debug("[AUTH-POLL] Started polling for re-authentication");
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(10_000, cts.Token);
+                        if (_client == null) continue;
+                        var status = await _client.GetAuthStatusAsync(cts.Token);
+                        if (status.IsAuthenticated)
+                        {
+                            Debug($"[AUTH-POLL] Auth detected ({status.Login}) — triggering server restart");
+                            // Use cached token only — do NOT call ResolveGitHubTokenForServer()
+                            // here. The polling loop runs every 10s; re-reading Keychain would
+                            // trigger a macOS password dialog on every cycle.
+                            // See .claude/skills/auth-token-safety/SKILL.md (INV-A2).
+                            StopAuthPolling();
+                            var recovered = await TryRecoverPersistentServerAsync();
+                            if (recovered)
+                            {
+                                InvokeOnUI(() =>
+                                {
+                                    AuthNotice = null;
+                                    _ = FetchGitHubUserInfoAsync();
+                                    OnStateChanged?.Invoke();
+                                });
+                            }
+                            else
+                            {
+                                Debug("[AUTH-POLL] Server recovery failed — restarting polling");
+                                InvokeOnUI(() =>
+                                {
+                                    AuthNotice = "Authentication detected but server restart failed. Will retry...";
+                                    OnStateChanged?.Invoke();
+                                });
+                                StartAuthPolling();
+                            }
+                            return;
+                        }
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        Debug($"[AUTH-POLL] Error: {ex.Message}");
+                    }
+                }
+                Debug("[AUTH-POLL] Stopped polling");
+            }, cts.Token);
+        }
+    }
+
+    private void StopAuthPolling()
+    {
+        lock (_authPollLock)
+        {
+            if (_authPollCts != null)
+            {
+                _authPollCts.Cancel();
+                _authPollCts.Dispose();
+                _authPollCts = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolves a GitHub token from environment variables only (no Keychain, no subprocess).
+    /// Safe to call preemptively — never triggers a password dialog or blocks.
+    /// </summary>
+    internal static string? ResolveGitHubTokenFromEnv()
+    {
+        foreach (var envVar in new[] { "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN" })
+        {
+            var val = Environment.GetEnvironmentVariable(envVar);
+            if (!string.IsNullOrEmpty(val))
+            {
+                Console.WriteLine($"[AUTH] Resolved token from ${envVar}");
+                return val;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Full token resolution chain including macOS Keychain and gh CLI.
+    /// ⚠️ DANGEROUS: Keychain read triggers a macOS password dialog. Only call on
+    /// explicit user action (ReauthenticateAsync) or after confirmed auth failure.
+    /// Never call preemptively at startup or in automatic polling loops.
+    /// See .claude/skills/auth-token-safety/SKILL.md (INV-A1, INV-A2).
+    ///
+    /// Resolution order:
+    ///   1. COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars (no prompt)
+    ///   2. macOS Keychain entry written by `copilot login` (⚠️ may prompt)
+    ///   3. `gh auth token` if the gh CLI is installed (no prompt)
+    /// </summary>
+    internal static string? ResolveGitHubTokenForServer()
+    {
+        // 1. Environment variables (same precedence as copilot CLI) — no prompt
+        var envToken = ResolveGitHubTokenFromEnv();
+        if (envToken != null) return envToken;
+
+        // 2. macOS Keychain — `copilot login` stores the OAuth token here via keytar.node.
+        //    The headless server process may not inherit the ACL for this entry, so we read
+        //    it from the UI process (which has full login-keychain access) and forward it.
+        //    ⚠️ This triggers a macOS password dialog if PolyPilot isn't in the ACL.
+        if (OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst())
+        {
+            var keychainToken = TryReadCopilotKeychainToken();
+            if (keychainToken != null)
+            {
+                Console.WriteLine("[AUTH] Resolved token from macOS Keychain (copilot login)");
+                return keychainToken;
+            }
+        }
+
+        // 3. gh CLI fallback — works when the user authenticated via `gh auth login`
+        var ghToken = RunProcessWithTimeout("gh", new[] { "auth", "token" }, 5000);
+        if (ghToken != null)
+        {
+            Console.WriteLine("[AUTH] Resolved token from `gh auth token`");
+            return ghToken;
+        }
+
+        Console.WriteLine("[AUTH] No GitHub token could be resolved for server forwarding");
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the GitHub OAuth token stored by <c>copilot login</c> from the macOS login Keychain.
+    /// Uses the <c>security</c> CLI (built into macOS) so no extra entitlements are needed.
+    /// Returns null silently on any failure (missing entry, no access, etc.).
+    /// </summary>
+    internal static string? TryReadCopilotKeychainToken()
+    {
+        // `copilot login` stores the token via keytar.node under a service name that
+        // has changed across CLI versions. We try all known names (most common first).
+        foreach (var serviceName in new[] { "copilot-cli", "github-copilot", "GitHub Copilot" })
+        {
+            var token = RunProcessWithTimeout("security",
+                new[] { "find-generic-password", "-s", serviceName, "-w" }, 3000);
+            if (token != null)
+                return token;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Runs a process with a timeout, returning trimmed stdout on success or null on failure/timeout.
+    /// Kills the process if it exceeds the timeout to prevent zombies.
+    /// </summary>
+    internal static string? RunProcessWithTimeout(string fileName, string[] args, int timeoutMs)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = fileName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = false, // Don't redirect — unused output fills pipe buffer and blocks
+                CreateNoWindow = true
+            };
+            foreach (var arg in args)
+                psi.ArgumentList.Add(arg);
+
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return null;
+
+            // Read output asynchronously with timeout to prevent blocking on
+            // ACL dialogs (security) or network hangs (gh)
+            var readTask = proc.StandardOutput.ReadToEndAsync();
+            if (!proc.WaitForExit(timeoutMs))
+            {
+                try { proc.Kill(); } catch { }
+                // Drain the abandoned read task to avoid unobserved ObjectDisposedException
+                try { readTask.GetAwaiter().GetResult(); } catch { }
+                return null;
+            }
+            // Process exited within timeout — ReadToEndAsync should complete quickly
+            var output = readTask.GetAwaiter().GetResult().Trim();
+            return proc.ExitCode == 0 && !string.IsNullOrEmpty(output) ? output : null;
+        }
+        catch
+        {
+            return null;
         }
     }
 }

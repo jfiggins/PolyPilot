@@ -54,6 +54,25 @@
                     <button class="dismiss-btn" @onclick="DismissServerHealthNotice">Dismiss</button>
                 </div>
             }
+            @if (!string.IsNullOrEmpty(CopilotService.AuthNotice))
+            {
+                <div class="init-error-card auth-notice">
+                    <span class="init-error-icon">🔑</span>
+                    <div class="auth-notice-content">
+                        <p class="init-error-text">@CopilotService.AuthNotice</p>
+                        <div class="auth-command-row">
+                            <code class="auth-command">@CopilotService.GetLoginCommand()</code>
+                            <button class="copy-cmd-btn" @onclick="CopyLoginCommand" title="Copy to clipboard">📋</button>
+                        </div>
+                    </div>
+                    <div class="auth-notice-actions">
+                        <button class="retry-btn" @onclick="ReauthenticateAsync" disabled="@_isReauthenticating">
+                            @(_isReauthenticating ? "Restarting…" : "Re-authenticate")
+                        </button>
+                        <button class="dismiss-btn" @onclick="DismissAuthNotice">Dismiss</button>
+                    </div>
+                </div>
+            }
             @if (PlatformHelper.IsMobile && !CopilotService.IsInitialized && !_initializationComplete)
             {
                 <div class="restoring-indicator">
@@ -621,6 +640,19 @@
                     _initialGridSet = true; // Prevent RefreshState from overriding
                     Console.WriteLine($"[Dashboard] Will restore to grid view (no expanded session)");
                 }
+
+                // Restore draft text saved before an auto-update relaunch
+                if (uiState.Drafts?.Count > 0)
+                {
+                    foreach (var (name, text) in uiState.Drafts)
+                    {
+                        if (!string.IsNullOrWhiteSpace(text))
+                            draftBySession[name] = text;
+                    }
+                    Console.WriteLine($"[Dashboard] Restored {draftBySession.Count} draft(s) from pre-relaunch save");
+                    // Clear saved drafts so they don't persist across normal restarts
+                    CopilotService.SaveDraftsImmediate(new Dictionary<string, string>());
+                }
             }
             else
             {
@@ -690,6 +722,7 @@
             }
 
             GitAutoUpdate.Initialize();
+            GitAutoUpdate.OnBeforeRelaunch += HandleBeforeRelaunch;
             
             _initializationComplete = true; // Allow RefreshState to process changes now
         }
@@ -753,6 +786,34 @@
         StateHasChanged();
     }
 
+    private void DismissAuthNotice()
+    {
+        CopilotService.ClearAuthNotice();
+        StateHasChanged();
+    }
+
+    private bool _isReauthenticating;
+    private async Task ReauthenticateAsync()
+    {
+        if (_isReauthenticating) return;
+        _isReauthenticating = true;
+        StateHasChanged();
+        try
+        {
+            await CopilotService.ReauthenticateAsync();
+        }
+        finally
+        {
+            _isReauthenticating = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task CopyLoginCommand()
+    {
+        await CopyToClipboard(CopilotService.GetLoginCommand());
+    }
+
     private async Task DashboardScanQr()
     {
         var result = await QrScanner.ScanAsync();
@@ -761,7 +822,7 @@
         try
         {
             // Try JSON format first: { "url": "...", "token": "...", "lanUrl": "...", "lanToken": "..." }
-            var doc = System.Text.Json.JsonDocument.Parse(result);
+            using var doc = System.Text.Json.JsonDocument.Parse(result);
             if (doc.RootElement.TryGetProperty("url", out var urlProp))
                 mobileRemoteUrl = urlProp.GetString() ?? "";
             if (doc.RootElement.TryGetProperty("token", out var tokenProp))
@@ -840,6 +901,8 @@
                             }
                         }
                         // ArrowUp/Down: command history navigation
+                        // Only trigger when the cursor cannot move further in that direction
+                        // within the text (single-line at boundary, or already navigating history).
                         if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && isInput && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
                             var ta = e.target;
                             var atStart = ta.selectionStart === 0 && ta.selectionEnd === 0;
@@ -847,7 +910,17 @@
                             var card = ta.closest('[data-session]');
                             var sessionName = card ? card.dataset.session : '';
                             var histNavActive = sessionName && window.__histNavActive && window.__histNavActive[sessionName];
-                            if ((e.key === 'ArrowUp' && atStart) || (e.key === 'ArrowDown' && (atEnd || histNavActive))) {
+                            // For multi-line content, only navigate history when already in history mode.
+                            // For ArrowUp: trigger only when cursor is at position 0 AND on the first line.
+                            // For ArrowDown: trigger only when already navigating history (never on atEnd alone,
+                            //   which would clear user-typed text).
+                            var textBeforeCursor = ta.value.substring(0, ta.selectionStart);
+                            var textAfterCursor = ta.value.substring(ta.selectionStart);
+                            var cursorOnFirstLine = textBeforeCursor.indexOf('\n') === -1;
+                            var cursorOnLastLine = textAfterCursor.indexOf('\n') === -1;
+                            var triggerUp = e.key === 'ArrowUp' && atStart && cursorOnFirstLine;
+                            var triggerDown = e.key === 'ArrowDown' && histNavActive && atEnd && cursorOnLastLine;
+                            if (triggerUp || triggerDown) {
                                 if (sessionName && window.__dashRef) {
                                     e.preventDefault();
                                     window.__dashRef.invokeMethodAsync('JsNavigateHistory', sessionName, e.key === 'ArrowUp').then(function(isNav) {
@@ -952,6 +1025,13 @@
             catch (ObjectDisposedException) { }
         }
 
+        // Consume any pending drafts from "Continue in new session"
+        foreach (var kvp in CopilotService.PendingDrafts)
+        {
+            if (CopilotService.PendingDrafts.TryRemove(kvp.Key, out var draft))
+                draftBySession[kvp.Key] = draft;
+        }
+
         // Auto-scroll all card message containers to bottom
         // Restore draft text, focus, and cursor position — all in ONE JS call
         var draftsJson = "{}";
@@ -1011,6 +1091,7 @@
 
     private DateTime _lastRefresh = DateTime.MinValue;
     private volatile bool _renderDirty;
+    private volatile bool _contentDirty; // Set when content_delta arrives, cleared after render
     private Timer? _renderTimer;
     private Timer? _heartbeatTimer;
     private readonly ConcurrentDictionary<string, (int MessageCount, bool IsProcessing, int ToolCallCount, int ProcessingPhase, DateTime LastUpdatedAt)> _lastRenderedSnapshot = new();
@@ -1176,8 +1257,11 @@
             var active = CopilotService.ActiveSessionName;
             bool sessionSwitched = active != _lastActiveSession;
             
-            // Throttle non-switch state changes to max 2/sec, but always allow completed sessions through
-            if (!_refreshThrottle.ShouldRefresh(sessionSwitched, completedSessions.Count > 0))
+            // Throttle non-switch state changes to max 2/sec, but always allow completed sessions
+            // and active streaming content through
+            var isStreaming = _contentDirty;
+            if (isStreaming) _contentDirty = false;
+            if (!_refreshThrottle.ShouldRefresh(sessionSwitched, completedSessions.Count > 0, isStreaming))
                 return;
 
             sessions = CopilotService.GetAllSessions().ToList();
@@ -1287,6 +1371,7 @@
         if (!streamingBySession.ContainsKey(sessionName))
             streamingBySession[sessionName] = "";
         streamingBySession[sessionName] += content;
+        _contentDirty = true;
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
     }
@@ -1406,6 +1491,22 @@
         currentToolBySession.Remove(sessionName);
         if (sessionName == expandedSession || expandedSession == null)
             ScheduleRender();
+    }
+
+    /// <summary>
+    /// Called by GitAutoUpdateService just before relaunching.
+    /// Persists all in-progress draft text so it can be restored after restart.
+    /// </summary>
+    private void HandleBeforeRelaunch()
+    {
+        var nonEmpty = draftBySession
+            .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Value))
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        if (nonEmpty.Count > 0)
+        {
+            Console.WriteLine($"[Dashboard] Saving {nonEmpty.Count} draft(s) before relaunch");
+            CopilotService.SaveDraftsImmediate(nonEmpty);
+        }
     }
 
     private void HandleOrchestratorPhaseChanged(string groupId, OrchestratorPhase phase, string? detail)
@@ -1628,6 +1729,7 @@
 
             if (isOrchestrator && (imagePaths == null || imagePaths.Count == 0))
             {
+                Console.WriteLine($"[DISPATCH-BRANCH] Taking ORCHESTRATOR path for '{sessionName}' (groupId='{group!.Id}')");
                 AutoStartReflectionIfNeeded(group!.Id, finalPrompt);
                 _ = CopilotService.SendToMultiAgentGroupAsync(group!.Id, finalPrompt).ContinueWith(t =>
                 {
@@ -1643,6 +1745,11 @@
             }
             else
             {
+            // Defensive: log when an orchestrator bypasses the multi-agent pipeline
+            if (isOrchestrator)
+                Console.WriteLine($"[DISPATCH-BRANCH] ⚠️ ORCHESTRATOR '{sessionName}' taking DIRECT path (imagePaths={imagePaths?.Count ?? -1}, agentMode={agentMode}) — safety net will catch @worker blocks");
+            else
+                Console.WriteLine($"[DISPATCH-BRANCH] Taking DIRECT path for '{sessionName}' (isOrch={isOrchestrator}, agentMode={agentMode})");
             // If this is an orchestrator but images are present, warn the user
             if (isOrchestrator && imagePaths is { Count: > 0 })
             {
@@ -1803,15 +1910,20 @@
                     "- `/status` — Show git status\n" +
                     "- `/prompt` — List saved prompts (`/prompt use|save|edit|show|delete`)\n" +
                     "- `/usage` — Show token usage and quota for this session\n" +
+                    "- `/agent [name]` — List or select a CLI agent\n" +
+                    "- `/fleet <prompt>` — Start fleet mode (parallel subagent execution)\n" +
                     "- `/mcp` — List MCP servers (`/mcp enable|disable <name>`, `/mcp reload` to restart)\n" +
                     "- `/plugin` — List installed plugins (enable/disable with `/plugin enable|disable <name>`)\n" +
-                    "- `/reflect <goal>` — Start a reflection cycle (`/reflect help` for details)\n" +
                     "- `!<command>` — Run a shell command"));
                 break;
 
             case "clear":
                 CopilotService.ClearHistory(sessionName);
                 session.History.Add(ChatMessage.SystemMessage("Chat history cleared."));
+                break;
+
+            case "agent":
+                await HandleAgentCommand(session, sessionName, arg);
                 break;
 
             case "version":
@@ -1926,8 +2038,8 @@
                 HandlePluginCommand(session, arg);
                 break;
 
-            case "reflect":
-                await HandleReflectCommand(session, sessionName, arg);
+            case "fleet":
+                await HandleFleetCommand(session, sessionName, arg);
                 break;
 
             case "prompt":
@@ -2152,136 +2264,72 @@
         }
     }
 
-    private async Task HandleReflectCommand(AgentSessionInfo session, string sessionName, string arg)
+    private async Task HandleAgentCommand(AgentSessionInfo session, string sessionName, string arg)
     {
-        var subParts = arg.Split(' ', 2, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        var sub = subParts.Length > 0 ? subParts[0].ToLowerInvariant() : "";
-
-        if (sub == "stop")
+        // /agent — list available agents
+        // /agent <name> — select agent
+        // /agent deselect — deselect current agent
+        if (string.IsNullOrWhiteSpace(arg))
         {
-            CopilotService.StopReflectionCycle(sessionName);
-            session.History.Add(ChatMessage.SystemMessage("🛑 Reflection cycle stopped."));
-            return;
-        }
+            // List agents from the API and from local discovery
+            var apiAgents = await CopilotService.ListAgentsFromApiAsync(sessionName);
+            var localAgents = CopilotService.DiscoverAvailableAgents(session.WorkingDirectory);
 
-        if (sub == "pause")
-        {
-            if (session.ReflectionCycle is { IsActive: true, IsPaused: false })
+            var lines = new List<string> { "**Available agents:**" };
+
+            if (apiAgents.Count > 0)
             {
-                session.ReflectionCycle.IsPaused = true;
-                session.History.Add(ChatMessage.SystemMessage("⏸️ Reflection paused. Use `/reflect resume` to continue."));
+                lines.Add("*CLI agents:*");
+                foreach (var a in apiAgents)
+                    lines.Add($"- `{a.Name}` — {a.Description}");
             }
+
+            if (localAgents.Count > 0)
+            {
+                lines.Add("*Local agents (from repo):*");
+                foreach (var a in localAgents)
+                    lines.Add($"- `{a.Name}` — {a.Description}");
+            }
+
+            if (apiAgents.Count == 0 && localAgents.Count == 0)
+                lines.Add("No agents found. Try adding agent markdown files in `.github/agents/` or `.claude/agents/`.");
             else
-            {
-                session.History.Add(ChatMessage.ErrorMessage("No active reflection cycle to pause."));
-            }
-            return;
-        }
+                lines.Add("\nUse `/agent <name>` to select an agent, or `/agent deselect` to deselect.");
 
-        if (sub == "resume")
+            session.History.Add(ChatMessage.SystemMessage(string.Join("\n", lines)));
+        }
+        else if (string.Equals(arg, "deselect", StringComparison.OrdinalIgnoreCase))
         {
-            if (session.ReflectionCycle is { IsActive: true, IsPaused: true })
-            {
-                session.ReflectionCycle.IsPaused = false;
-                session.ReflectionCycle.ResetStallDetection();
-                session.History.Add(ChatMessage.SystemMessage("▶️ Reflection resumed."));
-                // Re-queue a follow-up to continue the cycle
-                var followUp = session.ReflectionCycle.BuildFollowUpPrompt("");
-                if (session.IsProcessing)
-                {
-                    session.MessageQueue.Add(followUp);
-                }
-                else
-                {
-                    // Dispatch immediately if session is idle
-                    _ = CopilotService.SendPromptAsync(sessionName, followUp, skipHistoryMessage: true);
-                }
-            }
+            var success = await CopilotService.DeselectAgentAsync(sessionName);
+            if (success)
+                session.History.Add(ChatMessage.SystemMessage("Agent deselected."));
             else
-            {
-                session.History.Add(ChatMessage.ErrorMessage("No paused reflection cycle to resume."));
-            }
-            return;
+                session.History.Add(ChatMessage.ErrorMessage("Failed to deselect agent. Is the session connected?"));
         }
-
-        if (sub == "status")
+        else
         {
-            if (session.ReflectionCycle is { IsActive: true } rc)
-            {
-                var status = rc.IsPaused ? "⏸️ Paused" : "🔄 Running";
-                var evalInfo = !string.IsNullOrEmpty(rc.EvaluatorSessionName) ? "independent evaluator" : "self-evaluation";
-                var feedback = !string.IsNullOrEmpty(rc.EvaluatorFeedback) ? $"\n**Last feedback:** {rc.EvaluatorFeedback}" : "";
-                session.History.Add(ChatMessage.SystemMessage(
-                    $"{status} — **{rc.Goal}**\n" +
-                    $"Iteration {rc.CurrentIteration}/{rc.MaxIterations} · {evalInfo}{feedback}"));
-            }
+            var success = await CopilotService.SelectAgentAsync(sessionName, arg);
+            if (success)
+                session.History.Add(ChatMessage.SystemMessage($"Agent **{arg}** selected."));
             else
-            {
-                session.History.Add(ChatMessage.SystemMessage("No active reflection cycle."));
-            }
-            return;
+                session.History.Add(ChatMessage.ErrorMessage($"Failed to select agent '{arg}'. Is the agent name correct?"));
         }
+    }
 
-        if (string.IsNullOrWhiteSpace(arg) || sub == "help")
+    private async Task HandleFleetCommand(AgentSessionInfo session, string sessionName, string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
         {
             session.History.Add(ChatMessage.SystemMessage(
-                "🔄 **Reflection Cycles** — Iterative goal-driven refinement\n\n" +
-                "**Usage:**\n" +
-                "```\n" +
-                "/reflect <goal>            Start a cycle (default 5 iterations)\n" +
-                "/reflect <goal> --max N    Set max iterations (default 5)\n" +
-                "/reflect stop              Cancel active cycle\n" +
-                "/reflect pause             Pause without cancelling\n" +
-                "/reflect resume            Resume paused cycle\n" +
-                "/reflect status            Show current cycle progress\n" +
-                "/reflect help              Show this help\n" +
-                "```\n\n" +
-                "**How it works:**\n" +
-                "1. You set a goal → the worker starts iterating\n" +
-                "2. After each response, an **independent evaluator** judges the result\n" +
-                "3. If the evaluator says FAIL, its feedback is sent back to the worker\n" +
-                "4. Cycle ends when: ✅ evaluator says PASS | ⚠️ stalled | ⏱️ max iterations\n\n" +
-                "**Examples:**\n" +
-                "```\n" +
-                "/reflect write a haiku about rain --max 4\n" +
-                "/reflect fix the login bug and add tests --max 8\n" +
-                "/reflect refactor this function for readability\n" +
-                "```\n\n" +
-                "**Tips:**\n" +
-                "- Send messages during a cycle to steer the worker\n" +
-                "- Click the 🔄 pill in the header to stop\n" +
-                "- The evaluator is strict early on, lenient on the final iteration"));
+                "**Usage:** `/fleet <prompt>`\n\nStarts fleet mode, which enables parallel subagent execution for the given prompt."));
             return;
         }
 
-        // Parse --max N from the goal text (accept em-dash — which macOS auto-substitutes for --)
-        int maxIterations = 5;
-        var goal = arg;
-        var maxMatch = System.Text.RegularExpressions.Regex.Match(arg, @"(?:--|—|\u2014)max\s+(\d+)");
-        if (maxMatch.Success)
-        {
-            if (int.TryParse(maxMatch.Groups[1].Value, out var parsed) && parsed > 0)
-                maxIterations = parsed;
-            goal = arg.Remove(maxMatch.Index, maxMatch.Length).Trim();
-        }
-
-        if (string.IsNullOrWhiteSpace(goal))
-        {
-            session.History.Add(ChatMessage.ErrorMessage("Please provide a goal for the reflection cycle."));
-            return;
-        }
-
-        await CopilotService.StartReflectionCycleAsync(sessionName, goal, maxIterations);
-        session.History.Add(ChatMessage.SystemMessage($"🔄 Reflection cycle started — **{goal}** (max {maxIterations} iterations)"));
-        if (session.IsProcessing)
-        {
-            CopilotService.EnqueueMessage(sessionName, goal);
-            session.History.Add(ChatMessage.SystemMessage("⏳ Current turn is still running — queued reflection goal to run next."));
-            return;
-        }
-
-        // Send the goal as the initial prompt to kick off the first iteration
-        _ = CopilotService.SendPromptAsync(sessionName, goal);
+        var (started, error) = await CopilotService.StartFleetAsync(sessionName, arg);
+        if (started)
+            session.History.Add(ChatMessage.SystemMessage($"🚀 Fleet started for: *{arg}*"));
+        else
+            session.History.Add(ChatMessage.ErrorMessage($"Failed to start fleet mode: {error ?? "Unknown error"}"));
     }
 
     private async Task HandlePromptCommand(string sessionName, AgentSessionInfo session, string arg)
@@ -3352,14 +3400,8 @@
 
     // === Model, plan mode, font, token helpers ===
 
-    private static readonly string[] _fallbackModels = new[]
-    {
-        "claude-opus-4.6", "claude-opus-4.6-fast", "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5",
-        "gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5", "gpt-5-mini", "gpt-4.1",
-        "gemini-3-pro-preview",
-    };
     private IReadOnlyList<string> availableModels =>
-        CopilotService.AvailableModels.Count > 0 ? CopilotService.AvailableModels : _fallbackModels;
+        CopilotService.AvailableModels.Count > 0 ? CopilotService.AvailableModels : ModelHelper.FallbackModels;
 
     private string GetSessionModel(AgentSessionInfo session)
     {
@@ -3514,6 +3556,7 @@
         CopilotService.OnOrchestratorPhaseChanged -= HandleOrchestratorPhaseChanged;
         FiestaService.OnStateChanged -= HandleFiestaStateChanged;
         FiestaService.OnHostTaskUpdate -= HandleFiestaTaskUpdate;
+        GitAutoUpdate.OnBeforeRelaunch -= HandleBeforeRelaunch;
         _heartbeatTimer?.Dispose();
         _heartbeatTimer = null;
         _renderTimer?.Dispose();

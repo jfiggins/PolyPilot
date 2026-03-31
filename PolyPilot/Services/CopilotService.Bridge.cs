@@ -217,6 +217,9 @@ public partial class CopilotService
             // Increment generation counter — each sub-turn gets a new generation so
             // a delayed guard removal from a previous sub-turn won't kill this one.
             _remoteStreamingSessions.AddOrUpdate(s, 1, (_, prev) => prev + 1);
+            // Clear the TurnEnd guard — a new turn is starting, so sessions_list should be
+            // allowed to sync IsProcessing=true again.
+            _recentTurnEndSessions.TryRemove(s, out _);
             // Set IsProcessing on the UI thread to avoid race with TurnEnd:
             // When TurnEnd and TurnStart arrive back-to-back, both InvokeOnUI callbacks
             // are queued. TurnEnd fires first (sets false), then TurnStart fires (sets true).
@@ -245,6 +248,8 @@ public partial class CopilotService
                     session.ProcessingStartedAt = null;
                     session.ToolCallCount = 0;
                     session.ProcessingPhase = 0;
+                    // Guard against stale sessions_list re-setting IsProcessing=true
+                    _recentTurnEndSessions[s] = DateTime.UtcNow;
                     // Mark last assistant message as complete
                     var lastAssistant = session.History.LastOrDefault(m => m.IsAssistant && !m.IsComplete);
                     if (lastAssistant != null) { lastAssistant.IsComplete = true; lastAssistant.Model = session.Model; }
@@ -280,7 +285,23 @@ public partial class CopilotService
                 }
             });
         };
-        _bridgeClient.OnSessionComplete += (s, sum) => InvokeOnUI(() => OnSessionComplete?.Invoke(s, sum));
+        _bridgeClient.OnSessionComplete += (s, sum) => InvokeOnUI(() =>
+        {
+            // Belt-and-suspenders: also clear IsProcessing on session_complete in case
+            // the turn_end message was lost or arrived out of order.
+            var session = GetRemoteSession(s);
+            if (session != null && session.IsProcessing)
+            {
+                Debug($"[BRIDGE-SESSION-COMPLETE] '{session.Name}' clearing stale IsProcessing");
+                session.IsProcessing = false;
+                session.IsResumed = false;
+                session.ProcessingStartedAt = null;
+                session.ToolCallCount = 0;
+                session.ProcessingPhase = 0;
+                _recentTurnEndSessions[s] = DateTime.UtcNow;
+            }
+            OnSessionComplete?.Invoke(s, sum);
+        });
         _bridgeClient.OnError += (s, e) => InvokeOnUI(() =>
         {
             // Ignore errors for sessions already deleted locally (e.g., SDK error during dispose)
@@ -452,7 +473,7 @@ public partial class CopilotService
     /// <summary>
     /// Sync remote session list from WsBridgeClient into our local _sessions dictionary.
     /// </summary>
-    private void SyncRemoteSessions()
+    internal void SyncRemoteSessions()
     {
         var remoteSessions = _bridgeClient.Sessions;
         var remoteActive = _bridgeClient.ActiveSessionName;
@@ -499,11 +520,31 @@ public partial class CopilotService
                 // sessions list, which may be stale by the time it arrives.
                 if (!_remoteStreamingSessions.ContainsKey(rs.Name))
                 {
-                    state.Info.IsProcessing = rs.IsProcessing;
-                    state.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
-                    state.Info.ToolCallCount = rs.ToolCallCount;
-                    state.Info.ProcessingPhase = rs.ProcessingPhase;
+                    // Don't let a stale sessions_list snapshot re-set IsProcessing=true after
+                    // TurnEnd already cleared it. The debounced sessions_list may have been
+                    // captured before CompleteResponse ran on the server.
+                    bool turnEndGuardActive = rs.IsProcessing &&
+                        _recentTurnEndSessions.TryGetValue(rs.Name, out var turnEndTime) &&
+                        (DateTime.UtcNow - turnEndTime).TotalSeconds < 5;
+
+                    if (!turnEndGuardActive)
+                    {
+                        if (state.Info.IsProcessing != rs.IsProcessing)
+                            Debug($"SyncRemoteSessions: '{rs.Name}' IsProcessing {state.Info.IsProcessing} -> {rs.IsProcessing}");
+                        state.Info.IsProcessing = rs.IsProcessing;
+                        state.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
+                        state.Info.ToolCallCount = rs.ToolCallCount;
+                        state.Info.ProcessingPhase = rs.ProcessingPhase;
+                    }
+                    else
+                    {
+                        Debug($"SyncRemoteSessions: '{rs.Name}' TurnEnd guard blocked IsProcessing=true");
+                    }
                     state.Info.MessageCount = rs.MessageCount;
+                }
+                else
+                {
+                    Debug($"SyncRemoteSessions: '{rs.Name}' skipped — streaming guard active");
                 }
                 if (!string.IsNullOrEmpty(rs.Model))
                     state.Info.Model = rs.Model;
@@ -620,6 +661,174 @@ public partial class CopilotService
     {
         if (!IsRemoteMode) return;
         await _bridgeClient.RequestHistoryAsync(sessionName, limit: null);
+    }
+
+    /// <summary>
+    /// Force a full sync of sessions and history from the remote server.
+    /// Returns diagnostic info about what changed (for the sync button on mobile).
+    /// </summary>
+    public async Task<SyncResult> ForceRefreshRemoteAsync(string? activeSessionName = null)
+    {
+        if (!IsRemoteMode || !_bridgeClient.IsConnected)
+            return new SyncResult { Success = false, Message = "Not connected" };
+
+        var result = new SyncResult();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        try
+        {
+            // Snapshot pre-sync state
+            var preSyncSessionCount = _sessions.Count;
+            var preSyncMessageCount = 0;
+            AgentSessionInfo? activeInfo = null;
+            if (activeSessionName != null && _sessions.TryGetValue(activeSessionName, out var activeState))
+            {
+                activeInfo = activeState.Info;
+                lock (activeInfo.HistoryLock)
+                    preSyncMessageCount = activeInfo.History.Count;
+            }
+
+            // Request fresh sessions + full history for active session
+            await _bridgeClient.RequestSessionsAsync();
+
+            // Snapshot the existing history cache entry so we can detect when the server responds
+            List<ChatMessage>? preSyncCachedHistory = null;
+            if (activeSessionName != null)
+            {
+                _bridgeClient.SessionHistories.TryGetValue(activeSessionName, out preSyncCachedHistory);
+                await _bridgeClient.RequestHistoryAsync(activeSessionName, limit: null);
+            }
+
+            // Wait for the server response to populate SessionHistories, with timeout.
+            // The old Task.Delay(500) was racy — if the response took >500ms the sync silently
+            // reported "Already up to date". Poll for the cache reference to change instead.
+            if (activeSessionName != null)
+            {
+                var deadline = sw.ElapsedMilliseconds + 3000; // 3s timeout
+                while (sw.ElapsedMilliseconds < deadline)
+                {
+                    if (_bridgeClient.SessionHistories.TryGetValue(activeSessionName, out var current)
+                        && !ReferenceEquals(current, preSyncCachedHistory))
+                        break;
+                    await Task.Delay(50);
+                }
+            }
+            else
+            {
+                // No active session — just wait briefly for sessions list
+                await Task.Delay(500);
+            }
+
+            // Force-apply server history for the active session, conditionally bypassing the streaming guard.
+            // SyncRemoteSessions skips sessions in _remoteStreamingSessions to avoid overwriting
+            // incrementally-built content. But a user-initiated force sync should replace local history
+            // when the server has more messages (missed during disconnect) or the session isn't streaming.
+            if (activeSessionName != null
+                && _bridgeClient.SessionHistories.TryGetValue(activeSessionName, out var serverMessages)
+                && _sessions.TryGetValue(activeSessionName, out var forceState))
+            {
+                var isActivelyStreaming = _remoteStreamingSessions.ContainsKey(activeSessionName);
+                lock (forceState.Info.HistoryLock)
+                {
+                    var localCount = forceState.Info.History.Count;
+                    if (!isActivelyStreaming || serverMessages.Count > localCount)
+                    {
+                        forceState.Info.History.Clear();
+                        forceState.Info.History.AddRange(serverMessages);
+                        forceState.Info.MessageCount = forceState.Info.History.Count;
+                        Debug($"[SYNC] Force-applied {serverMessages.Count} messages for '{activeSessionName}' (streaming={isActivelyStreaming}, local={localCount})");
+                    }
+                }
+            }
+
+            // Force-sync processing state for ALL sessions from the server snapshot.
+            // SyncRemoteSessions skips sessions in _remoteStreamingSessions, but a user-initiated
+            // force sync should always apply the server's authoritative IsProcessing state.
+            // Also clear stuck streaming guards — if the server says a session is idle,
+            // any lingering guard from a dropped connection should be cleared.
+            foreach (var rs in _bridgeClient.Sessions)
+            {
+                if (_sessions.TryGetValue(rs.Name, out var syncState))
+                {
+                    if (syncState.Info.IsProcessing != rs.IsProcessing)
+                        Debug($"[SYNC] '{rs.Name}' IsProcessing {syncState.Info.IsProcessing} -> {rs.IsProcessing}");
+                    syncState.Info.IsProcessing = rs.IsProcessing;
+                    syncState.Info.ProcessingStartedAt = rs.ProcessingStartedAt;
+                    syncState.Info.ToolCallCount = rs.ToolCallCount;
+                    syncState.Info.ProcessingPhase = rs.ProcessingPhase;
+                    // Clear stuck streaming guard if server says session is idle
+                    if (!rs.IsProcessing)
+                        _remoteStreamingSessions.TryRemove(rs.Name, out _);
+                }
+            }
+
+            // Snapshot post-sync state
+            var postSyncSessionCount = _sessions.Count;
+            var postSyncMessageCount = 0;
+            if (activeInfo != null)
+            {
+                lock (activeInfo.HistoryLock)
+                    postSyncMessageCount = activeInfo.History.Count;
+            }
+
+            var sessionDelta = postSyncSessionCount - preSyncSessionCount;
+            var messageDelta = postSyncMessageCount - preSyncMessageCount;
+
+            result.Success = true;
+            result.SessionCountBefore = preSyncSessionCount;
+            result.SessionCountAfter = postSyncSessionCount;
+            result.MessageCountBefore = preSyncMessageCount;
+            result.MessageCountAfter = postSyncMessageCount;
+            result.ElapsedMs = sw.ElapsedMilliseconds;
+
+            // Build user-facing message
+            var parts = new List<string>();
+            if (messageDelta > 0)
+                parts.Add($"{messageDelta} new message{(messageDelta != 1 ? "s" : "")}");
+            if (sessionDelta > 0)
+                parts.Add($"{sessionDelta} new session{(sessionDelta != 1 ? "s" : "")}");
+            result.Message = parts.Count > 0
+                ? $"Synced: {string.Join(", ", parts)}"
+                : "Already up to date";
+
+            // Diagnostic logging: detect missed messages
+            if (messageDelta > 0)
+            {
+                Debug($"[SYNC] Force refresh for '{activeSessionName}': " +
+                      $"{preSyncMessageCount}→{postSyncMessageCount} messages " +
+                      $"(+{messageDelta}), {sw.ElapsedMilliseconds}ms. " +
+                      $"⚠️ {messageDelta} messages were missed during streaming.");
+            }
+            else
+            {
+                Debug($"[SYNC] Force refresh for '{activeSessionName}': " +
+                      $"{postSyncMessageCount} messages, up to date, {sw.ElapsedMilliseconds}ms");
+            }
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Message = $"Sync failed: {ex.Message}";
+            result.ElapsedMs = sw.ElapsedMilliseconds;
+            Debug($"[SYNC] Force refresh failed: {ex.Message}");
+        }
+
+        OnStateChanged?.Invoke();
+        return result;
+    }
+
+    /// <summary>
+    /// Result of a forced remote sync operation.
+    /// </summary>
+    public class SyncResult
+    {
+        public bool Success { get; set; }
+        public string Message { get; set; } = "";
+        public int SessionCountBefore { get; set; }
+        public int SessionCountAfter { get; set; }
+        public int MessageCountBefore { get; set; }
+        public int MessageCountAfter { get; set; }
+        public long ElapsedMs { get; set; }
     }
 
     // --- Remote repo operations ---

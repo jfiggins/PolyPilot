@@ -13,12 +13,15 @@ namespace PolyPilot.Services;
 public class FiestaService : IDisposable
 {
     private const int DiscoveryPort = 43223;
+    private const int MaxPendingPairRequests = 5;
+    private const int MaxPendingPairRequestsPerIp = 2;
     private static readonly TimeSpan DiscoveryInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DiscoveryStaleAfter = TimeSpan.FromSeconds(20);
     private static readonly Regex MentionRegex = new(@"(?<!\S)@(?<name>[A-Za-z0-9._-]+)", RegexOptions.Compiled);
 
     private readonly CopilotService _copilot;
     private readonly WsBridgeServer _bridgeServer;
+    private readonly TailscaleService? _tailscale;
     private readonly ConcurrentDictionary<string, FiestaDiscoveredWorker> _discoveredWorkers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, FiestaSessionState> _activeFiestas = new(StringComparer.Ordinal);
     private readonly object _stateLock = new();
@@ -34,40 +37,34 @@ public class FiestaService : IDisposable
     private Task? _broadcastTask;
     private Task? _listenTask;
     private static string? _stateFilePath;
+    private readonly Dictionary<string, PendingPairRequest> _pendingPairRequests = new(StringComparer.Ordinal);
+
+    internal static void SetStateFilePathForTesting(string path) => _stateFilePath = path;
 
     public event Action? OnStateChanged;
     public event Action<string, FiestaTaskUpdate>? OnHostTaskUpdate;
+    /// <summary>Fires on the worker side when a remote host requests pairing. Args: requestId, hostName, remoteIp.</summary>
+    public event Action<string, string, string>? OnPairRequested;
+    /// <summary>
+    /// Fires when ApprovePairRequestAsync succeeds in claiming the TCS but the send fails.
+    /// The pairing cannot be completed for this request — the host will time out and show "Unreachable".
+    /// UI should prompt the user to retry pairing from the host side.
+    /// Args: requestId, errorMessage.
+    /// </summary>
+    public event Action<string, string>? OnPairApprovalSendFailed;
 
-    public FiestaService(CopilotService copilot, WsBridgeServer bridgeServer)
+    public FiestaService(CopilotService copilot, WsBridgeServer bridgeServer, TailscaleService tailscale)
     {
         _copilot = copilot;
         _bridgeServer = bridgeServer;
+        _tailscale = tailscale;
         _bridgeServer.SetFiestaService(this);
         LoadState();
         if (PlatformHelper.IsDesktop)
             StartDiscovery();
     }
 
-    private static string StateFilePath => _stateFilePath ??= Path.Combine(GetPolyPilotBaseDir(), "fiesta.json");
-
-    private static string GetPolyPilotBaseDir()
-    {
-        try
-        {
-#if IOS || ANDROID
-            return Path.Combine(FileSystem.AppDataDirectory, ".polypilot");
-#else
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            if (string.IsNullOrEmpty(home))
-                home = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            return Path.Combine(home, ".polypilot");
-#endif
-        }
-        catch
-        {
-            return Path.Combine(Path.GetTempPath(), ".polypilot");
-        }
-    }
+    private static string StateFilePath => _stateFilePath ??= Path.Combine(CopilotService.BaseDir, "fiesta.json");
 
     public IReadOnlyList<FiestaDiscoveredWorker> DiscoveredWorkers =>
         _discoveredWorkers.Values
@@ -110,16 +107,20 @@ public class FiestaService : IDisposable
     }
 
     public void LinkWorker(string name, string hostname, string bridgeUrl, string token)
+        => LinkWorkerAndReturn(name, hostname, bridgeUrl, token);
+
+    private FiestaLinkedWorker? LinkWorkerAndReturn(string name, string hostname, string bridgeUrl, string token)
     {
         var normalizedUrl = NormalizeBridgeUrl(bridgeUrl);
         if (string.IsNullOrWhiteSpace(normalizedUrl) || string.IsNullOrWhiteSpace(token))
-            return;
+            return null;
 
         var workerName = string.IsNullOrWhiteSpace(name)
             ? (!string.IsNullOrWhiteSpace(hostname) ? hostname.Trim() : normalizedUrl)
             : name.Trim();
         var workerHostname = string.IsNullOrWhiteSpace(hostname) ? workerName : hostname.Trim();
 
+        FiestaLinkedWorker result;
         lock (_stateLock)
         {
             var existing = _linkedWorkers.FirstOrDefault(w =>
@@ -133,23 +134,27 @@ public class FiestaService : IDisposable
                 existing.BridgeUrl = normalizedUrl;
                 existing.Token = token.Trim();
                 existing.LinkedAt = DateTime.UtcNow;
+                result = existing;
             }
             else
             {
-                _linkedWorkers.Add(new FiestaLinkedWorker
+                var added = new FiestaLinkedWorker
                 {
                     Name = workerName,
                     Hostname = workerHostname,
                     BridgeUrl = normalizedUrl,
                     Token = token.Trim(),
                     LinkedAt = DateTime.UtcNow
-                });
+                };
+                _linkedWorkers.Add(added);
+                result = added;
             }
         }
 
         SaveState();
         UpdateLinkedWorkerPresence();
         OnStateChanged?.Invoke();
+        return result;
     }
 
     public void RemoveLinkedWorker(string workerId)
@@ -304,6 +309,402 @@ public class FiestaService : IDisposable
 
         await HandleFiestaAssignAsync(clientId, ws, assign, ct);
         return true;
+    }
+
+    // ---- Pairing string (Feature B) ----
+
+    public IReadOnlyList<PendingPairRequestInfo> PendingPairRequests
+    {
+        get
+        {
+            lock (_stateLock)
+                return _pendingPairRequests.Values
+                    .Where(r => r.ExpiresAt > DateTime.UtcNow)
+                    .Select(r => new PendingPairRequestInfo
+                    {
+                        RequestId = r.RequestId,
+                        HostName = r.HostName,
+                        RemoteIp = r.RemoteIp,
+                        ExpiresAt = r.ExpiresAt
+                    })
+                    .ToList();
+        }
+    }
+
+    public string GeneratePairingString(string? preferredHost = null)
+    {
+        if (!_bridgeServer.IsRunning)
+            throw new InvalidOperationException("Bridge server is not running. Enable Direct Sharing first.");
+
+        var token = EnsureServerPassword();
+
+        // If no explicit host supplied, prefer Tailscale IP/MagicDNS when running —
+        // it works across different networks, not just the local LAN.
+        if (preferredHost == null && _tailscale?.IsRunning == true)
+            preferredHost = _tailscale.MagicDnsName ?? _tailscale.TailscaleIp;
+
+        var localIp = preferredHost ?? GetPrimaryLocalIpAddress() ?? "localhost";
+        var url = $"http://{localIp}:{_bridgeServer.BridgePort}";
+
+        var payload = new FiestaPairingPayload
+        {
+            Url = url,
+            Token = token,
+            Hostname = Environment.MachineName
+        };
+        var json = JsonSerializer.Serialize(payload, _jsonOptions);
+        var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+                         .TrimEnd('=')
+                         .Replace('+', '-')
+                         .Replace('/', '_');
+        return $"pp+{b64}";
+    }
+
+    public FiestaLinkedWorker ParseAndLinkPairingString(string pairingString)
+    {
+        if (string.IsNullOrWhiteSpace(pairingString) || !pairingString.StartsWith("pp+", StringComparison.Ordinal))
+            throw new FormatException("Not a valid PolyPilot pairing string (must start with 'pp+').");
+        if (pairingString.Length > 4096)
+            throw new FormatException("Pairing string is too large.");
+
+        var b64 = pairingString[3..].Replace('-', '+').Replace('_', '/');
+        // Restore standard base64 padding
+        int remainder = b64.Length % 4;
+        var padded = remainder == 2 ? b64 + "=="
+                   : remainder == 3 ? b64 + "="
+                   : b64;
+
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(padded); }
+        catch (FormatException) { throw new FormatException("Pairing string is corrupted (invalid base64)."); }
+
+        var json = Encoding.UTF8.GetString(bytes);
+        var parsed = JsonSerializer.Deserialize<FiestaPairingPayload>(json, _jsonOptions)
+            ?? throw new FormatException("Pairing string payload is empty.");
+
+        if (string.IsNullOrWhiteSpace(parsed.Url))
+            throw new FormatException("Pairing string is missing a URL.");
+        if (string.IsNullOrWhiteSpace(parsed.Token))
+            throw new FormatException("Pairing string is missing a token.");
+
+        var name = !string.IsNullOrWhiteSpace(parsed.Hostname) ? parsed.Hostname : "Unknown";
+        var linked = LinkWorkerAndReturn(name, name, parsed.Url, parsed.Token)
+            ?? throw new InvalidOperationException("Failed to link worker (invalid URL or token).");
+        return CloneLinkedWorker(linked);
+    }
+
+    // ---- Push-to-pair — Worker (incoming) side (Feature C) ----
+
+    public async Task HandleIncomingPairHandshakeAsync(WebSocket ws, string remoteIp, CancellationToken ct)
+    {
+        // Read the initial pair request with a short timeout
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        readCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+        BridgeMessage? msg;
+        try { msg = await ReadSingleMessageAsync(ws, readCts.Token); }
+        catch (OperationCanceledException) { return; }
+
+        if (msg?.Type != BridgeMessageTypes.FiestaPairRequest) return;
+
+        var req = msg.GetPayload<FiestaPairRequestPayload>();
+        if (req == null || string.IsNullOrWhiteSpace(req.RequestId)) return;
+
+        var pending = new PendingPairRequest
+        {
+            RequestId = req.RequestId,
+            HostInstanceId = req.HostInstanceId,
+            HostName = req.HostName,
+            RemoteIp = remoteIp,
+            Socket = ws,
+            ExpiresAt = DateTime.UtcNow.AddSeconds(60)
+        };
+
+        // Capture the TCS before releasing the lock
+        TaskCompletionSource<bool> tcs;
+        bool isDuplicate;
+        lock (_stateLock)
+        {
+            var requestsFromIp = _pendingPairRequests.Values.Count(r => r.RemoteIp == remoteIp);
+            isDuplicate = _pendingPairRequests.Count >= MaxPendingPairRequests
+                       || requestsFromIp >= MaxPendingPairRequestsPerIp;
+            if (!isDuplicate)
+            {
+                _pendingPairRequests[req.RequestId] = pending;
+                tcs = pending.CompletionSource;
+            }
+            else
+            {
+                tcs = null!; // won't be used
+            }
+        }
+
+        if (isDuplicate)
+        {
+            // Already handling a pair request — deny inline so the send completes
+            // before this method returns and the caller closes the socket.
+            try
+            {
+                await SendAsync(ws, BridgeMessage.Create(BridgeMessageTypes.FiestaPairResponse,
+                    new FiestaPairResponsePayload { RequestId = req.RequestId, Approved = false }), ct);
+            }
+            catch { }
+            return;
+        }
+
+        OnPairRequested?.Invoke(req.RequestId, req.HostName, remoteIp);
+        OnStateChanged?.Invoke();
+
+        // Wait for user approval/denial (up to 60s)
+        using var expiryCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        expiryCts.CancelAfter(TimeSpan.FromSeconds(60));
+        try
+        {
+            await tcs.Task.WaitAsync(expiryCts.Token);
+            // Winner's send is in-flight — wait for it to complete before returning so the
+            // caller's finally (socket close) doesn't race the outgoing message.
+            try { await pending.SendComplete.Task.WaitAsync(TimeSpan.FromSeconds(5)); } catch (TimeoutException) { } catch (OperationCanceledException) { }
+        }
+        catch (OperationCanceledException)
+        {
+            // Timed out — auto-deny. Claim via TrySetResult first so we don't race with
+            // ApprovePairRequestAsync (only the winner of TrySetResult sends).
+            if (tcs.TrySetResult(false))
+            {
+                try
+                {
+                    await SendAsync(ws, BridgeMessage.Create(BridgeMessageTypes.FiestaPairResponse,
+                        new FiestaPairResponsePayload { RequestId = req.RequestId, Approved = false }), CancellationToken.None);
+                }
+                catch { }
+                finally
+                {
+                    pending.SendComplete.TrySetResult();
+                }
+            }
+            else
+            {
+                // Approve already won — wait for its send to finish before closing socket
+                try { await pending.SendComplete.Task.WaitAsync(TimeSpan.FromSeconds(5)); } catch (TimeoutException) { } catch (OperationCanceledException) { }
+            }
+        }
+        finally
+        {
+            lock (_stateLock) _pendingPairRequests.Remove(req.RequestId);
+            OnStateChanged?.Invoke();
+        }
+    }
+
+    public async Task<bool> ApprovePairRequestAsync(string requestId)
+    {
+        PendingPairRequest? pending;
+        TaskCompletionSource<bool>? tcs;
+        lock (_stateLock)
+        {
+            if (!_pendingPairRequests.TryGetValue(requestId, out pending)) return false;
+            tcs = pending.CompletionSource;
+        }
+
+        var token = EnsureServerPassword();
+        var localIp = (_tailscale?.IsRunning == true ? (_tailscale.MagicDnsName ?? _tailscale.TailscaleIp) : null)
+                      ?? GetPrimaryLocalIpAddress() ?? "localhost";
+        var bridgeUrl = $"http://{localIp}:{_bridgeServer.BridgePort}";
+
+        // Atomically claim ownership. If the timeout already fired (TrySetResult(false) won),
+        // skip sending — the WebSocket may already be closed.
+        if (!tcs.TrySetResult(true))
+            return false; // timeout already won, don't attempt a concurrent send
+
+        try
+        {
+            await SendAsync(pending.Socket, BridgeMessage.Create(
+                BridgeMessageTypes.FiestaPairResponse,
+                new FiestaPairResponsePayload
+                {
+                    RequestId = requestId,
+                    Approved = true,
+                    BridgeUrl = bridgeUrl,
+                    Token = token,
+                    WorkerName = Environment.MachineName
+                }), CancellationToken.None);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // TCS already resolved to true so this request cannot be retried or denied.
+            // Log clearly and fire event so the UI can prompt the user to retry from the host side.
+            var msg = ex.Message;
+            Console.WriteLine($"[Fiesta] Approval send failed (request={requestId}, irrecoverable): {msg}");
+            OnPairApprovalSendFailed?.Invoke(requestId, msg);
+            return false;
+        }
+        finally
+        {
+            // Signal that our send is complete so HandleIncomingPairHandshakeAsync
+            // can safely return (allowing the caller to close the socket).
+            pending.SendComplete.TrySetResult();
+        }
+    }
+
+    public async Task DenyPairRequestAsync(string requestId)
+    {
+        PendingPairRequest? pending;
+        TaskCompletionSource<bool>? tcs;
+        lock (_stateLock)
+        {
+            if (!_pendingPairRequests.TryGetValue(requestId, out pending)) return;
+            tcs = pending.CompletionSource;
+        }
+
+        // Atomically claim ownership — if approve already won, skip sending.
+        if (!tcs.TrySetResult(false))
+            return; // approve already won, don't race on the socket
+
+        try
+        {
+            await SendAsync(pending.Socket, BridgeMessage.Create(
+                BridgeMessageTypes.FiestaPairResponse,
+                new FiestaPairResponsePayload { RequestId = requestId, Approved = false }),
+                CancellationToken.None);
+        }
+        catch { }
+        finally
+        {
+            // Signal send complete so HandleIncomingPairHandshakeAsync can safely return.
+            pending.SendComplete.TrySetResult();
+        }
+    }
+
+    // Keep a synchronous shim for callers that can't await (e.g., Blazor @onclick non-async)
+    public void DenyPairRequest(string requestId) =>
+        _ = DenyPairRequestAsync(requestId);
+
+    // ---- Push-to-pair — Host (outgoing) side (Feature C) ----
+
+    public async Task<PairRequestResult> RequestPairAsync(FiestaDiscoveredWorker worker, CancellationToken ct = default)
+    {
+        var wsUri = ToWebSocketUri(worker.BridgeUrl);
+        // Append /pair path
+        wsUri = wsUri.TrimEnd('/') + "/pair";
+        var requestId = Guid.NewGuid().ToString("N");
+
+        try
+        {
+            using var ws = new ClientWebSocket();
+            // No auth header — /pair is intentionally unauthenticated
+            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            connectCts.CancelAfter(TimeSpan.FromSeconds(10));
+
+            await ws.ConnectAsync(new Uri(wsUri), connectCts.Token);
+
+            await SendAsync(ws, BridgeMessage.Create(
+                BridgeMessageTypes.FiestaPairRequest,
+                new FiestaPairRequestPayload
+                {
+                    RequestId = requestId,
+                    HostInstanceId = _instanceId,
+                    HostName = Environment.MachineName
+                }), ct);
+
+            // Wait up to 65s for the worker to approve or deny
+            using var responseCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            responseCts.CancelAfter(TimeSpan.FromSeconds(65));
+            var msg = await ReadSingleMessageAsync(ws, responseCts.Token);
+
+            if (msg?.Type != BridgeMessageTypes.FiestaPairResponse)
+                return PairRequestResult.Unreachable;
+
+            var resp = msg.GetPayload<FiestaPairResponsePayload>();
+            if (resp == null || !resp.Approved)
+                return PairRequestResult.Denied;
+
+            // Guard: an approval without connection details is a malformed response
+            if (string.IsNullOrWhiteSpace(resp.BridgeUrl) || string.IsNullOrWhiteSpace(resp.Token))
+                return PairRequestResult.Unreachable;
+
+            var workerName = !string.IsNullOrWhiteSpace(resp.WorkerName) ? resp.WorkerName : worker.Hostname;
+            LinkWorker(workerName, worker.Hostname, resp.BridgeUrl, resp.Token);
+            return PairRequestResult.Approved;
+        }
+        catch (WebSocketException) { return PairRequestResult.Unreachable; }
+        catch (OperationCanceledException) { return PairRequestResult.Timeout; }
+    }
+
+    // ---- Shared helper: read a single framed WebSocket message ----
+
+    private static async Task<BridgeMessage?> ReadSingleMessageAsync(WebSocket ws, CancellationToken ct)
+    {
+        var buffer = new byte[65536];
+        var sb = new StringBuilder();
+        while (ws.State == WebSocketState.Open)
+        {
+            var result = await ws.ReceiveAsync(buffer, ct);
+            if (result.MessageType == WebSocketMessageType.Close) return null;
+            sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+            if (sb.Length > 256 * 1024) return null; // guard against unbounded frames on unauthenticated /pair path
+            if (result.EndOfMessage) break;
+        }
+        return BridgeMessage.Deserialize(sb.ToString());
+    }
+
+    // ---- Settings integration ----
+
+    private string EnsureServerPassword()
+    {
+        // Fast path: check the runtime value without disk I/O.
+        lock (_stateLock)
+        {
+            if (!string.IsNullOrWhiteSpace(_bridgeServer.ServerPassword))
+                return _bridgeServer.ServerPassword;
+        }
+
+        // Slow path: load settings outside the lock so steady-state pairing operations
+        // (which hold _stateLock for _pendingPairRequests / _linkedWorkers reads) are
+        // not blocked by disk I/O.
+        var settings = ConnectionSettings.Load();
+        string candidatePassword;
+        bool needsSave = false;
+
+        if (!string.IsNullOrWhiteSpace(settings.ServerPassword))
+        {
+            candidatePassword = settings.ServerPassword;
+        }
+        else
+        {
+            // Generate a candidate; the final winner is decided inside the lock below.
+            candidatePassword = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(18))
+                                       .Replace('+', '-').Replace('/', '_').TrimEnd('=');
+            needsSave = true;
+        }
+
+        // Re-enter the lock to elect exactly one winner.
+        // If another thread already stored a password we use that.
+        // If we win, we also save — under the lock — so the disk write and the
+        // runtime state stay in sync even when two threads race here simultaneously.
+        string password;
+        lock (_stateLock)
+        {
+            if (!string.IsNullOrWhiteSpace(_bridgeServer.ServerPassword))
+            {
+                // Another thread already set it — no save needed.
+                password = _bridgeServer.ServerPassword;
+            }
+            else
+            {
+                password = candidatePassword;
+                _bridgeServer.ServerPassword = password;
+                if (needsSave)
+                {
+                    // Persist inside the lock so disk and runtime value are always the same.
+                    // This I/O happens only once per process lifetime (when no password existed).
+                    settings.ServerPassword = password;
+                    settings.Save();
+                    Console.WriteLine("[Fiesta] Auto-generated server password for pairing.");
+                }
+            }
+        }
+
+        return password;
     }
 
     private async Task HandleFiestaAssignAsync(string clientId, WebSocket ws, FiestaAssignPayload assign, CancellationToken ct)
@@ -468,6 +869,11 @@ public class FiestaService : IDisposable
                 break;
 
             messageBuffer.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+            if (messageBuffer.Length > 256 * 1024)
+            {
+                try { await ws.CloseAsync(WebSocketCloseStatus.MessageTooBig, "Message exceeds 256KB limit", CancellationToken.None); } catch { }
+                break; // guard against unbounded frames
+            }
             if (!result.EndOfMessage)
                 continue;
 
@@ -586,7 +992,30 @@ public class FiestaService : IDisposable
     public static string GetFiestaWorkspaceDirectory(string fiestaName)
     {
         var safeName = SanitizeFiestaName(fiestaName);
-        return Path.Combine(GetPolyPilotBaseDir(), "workspace", safeName);
+        var baseDir = Path.GetFullPath(Path.Combine(CopilotService.BaseDir, "workspace"));
+        var fullPath = Path.GetFullPath(Path.Combine(baseDir, safeName));
+
+        // Primary guard: reject paths that escape baseDir by path components (covers ".." attacks).
+        var relativePath = Path.GetRelativePath(baseDir, fullPath);
+        if (relativePath.StartsWith("..", StringComparison.Ordinal))
+            throw new InvalidOperationException("Workspace path escapes the base directory.");
+
+        // Secondary guard: if the directory already exists, resolve symlinks and re-validate.
+        // Path.GetFullPath does NOT resolve symlinks, so a symlink inside the workspace tree
+        // could redirect to an arbitrary location. ResolveLinkTarget(returnFinalTarget: true)
+        // follows the full chain. Only needed when the directory exists (pre-created symlinks).
+        if (Directory.Exists(fullPath))
+        {
+            var resolved = Directory.ResolveLinkTarget(fullPath, returnFinalTarget: true)?.FullName;
+            if (resolved != null)
+            {
+                var resolvedRelative = Path.GetRelativePath(baseDir, resolved);
+                if (resolvedRelative.StartsWith("..", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Workspace directory is a symlink that escapes the base directory.");
+            }
+        }
+
+        return fullPath;
     }
 
     private static string SanitizeFiestaName(string fiestaName)
@@ -668,8 +1097,14 @@ public class FiestaService : IDisposable
     private void StartDiscovery()
     {
         _discoveryCts = new CancellationTokenSource();
-        _broadcastTask = Task.Run(() => BroadcastPresenceLoopAsync(_discoveryCts.Token));
-        _listenTask = Task.Run(() => ListenForWorkersLoopAsync(_discoveryCts.Token));
+        // Capture the token struct NOW, before Task.Run queues the work.
+        // If Dispose() runs before the thread-pool picks up the lambda, accessing
+        // _discoveryCts.Token on a disposed CTS throws ObjectDisposedException.
+        // A captured CancellationToken struct remains valid (IsCancellationRequested=true)
+        // even after the parent CTS is cancelled and disposed.
+        var token = _discoveryCts.Token;
+        _broadcastTask = Task.Run(() => BroadcastPresenceLoopAsync(token));
+        _listenTask = Task.Run(() => ListenForWorkersLoopAsync(token));
     }
 
     private async Task BroadcastPresenceLoopAsync(CancellationToken ct)
@@ -681,14 +1116,18 @@ public class FiestaService : IDisposable
             {
                 if (_bridgeServer.IsRunning && _bridgeServer.BridgePort > 0)
                 {
-                    var localIp = GetPrimaryLocalIpAddress();
-                    if (!string.IsNullOrEmpty(localIp))
+                    // Prefer Tailscale IP in the broadcast so peers that receive it can reach us
+                    // via Tailscale (works across networks). Fall back to primary LAN IP.
+                    string? advertiseIp = (_tailscale?.IsRunning == true)
+                        ? (_tailscale.TailscaleIp ?? GetPrimaryLocalIpAddress())
+                        : GetPrimaryLocalIpAddress();
+                    if (!string.IsNullOrEmpty(advertiseIp))
                     {
                         var announcement = new FiestaDiscoveryAnnouncement
                         {
                             InstanceId = _instanceId,
                             Hostname = Environment.MachineName,
-                            BridgeUrl = $"http://{localIp}:{_bridgeServer.BridgePort}",
+                            BridgeUrl = $"http://{advertiseIp}:{_bridgeServer.BridgePort}",
                             TimestampUtc = DateTime.UtcNow
                         };
 
@@ -714,6 +1153,7 @@ public class FiestaService : IDisposable
             try
             {
                 var result = await listener.ReceiveAsync(ct);
+                if (result.Buffer.Length > 4096) continue; // reject oversized discovery packets
                 var json = Encoding.UTF8.GetString(result.Buffer);
                 var announcement = JsonSerializer.Deserialize<FiestaDiscoveryAnnouncement>(json, _jsonOptions);
                 if (announcement == null || string.IsNullOrWhiteSpace(announcement.InstanceId))
@@ -780,22 +1220,89 @@ public class FiestaService : IDisposable
     {
         try
         {
+            string? best = null;
+            int bestScore = -1;
+
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (ni.OperationalStatus != OperationalStatus.Up) continue;
                 if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+                if (IsVirtualAdapterName(ni.Name)) continue;
 
-                var ip = ni.GetIPProperties().UnicastAddresses
+                var unicast = ni.GetIPProperties().UnicastAddresses
                     .FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork);
-                if (ip != null)
-                    return ip.Address.ToString();
+                if (unicast == null) continue;
+
+                var addr = unicast.Address.ToString();
+                if (IsVirtualAdapterIp(addr)) continue;
+
+                int score = ScoreNetworkInterface(ni.NetworkInterfaceType, addr);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = addr;
+                }
             }
+
+            return best;
         }
         catch
         {
             // Ignore and return null.
         }
         return null;
+    }
+
+    private static bool IsVirtualAdapterName(string name) =>
+        name.StartsWith("vEthernet", StringComparison.OrdinalIgnoreCase) ||   // Hyper-V
+        name.StartsWith("br-", StringComparison.OrdinalIgnoreCase) ||          // Docker bridge
+        name.StartsWith("virbr", StringComparison.OrdinalIgnoreCase) ||        // libvirt
+        name.Contains("docker", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("WSL", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("VMware", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("VirtualBox", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("ZeroTier", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsVirtualAdapterIp(string ip)
+    {
+        // Filter known virtual/container subnets that Docker and VM managers use by default.
+        // 172.17–172.24 covers Docker's default bridge (172.17), Docker custom networks
+        // (typically 172.18–172.24), and common VMware/VirtualBox host-only subnets.
+        // 172.25–172.31 are also in RFC-1918 /12 but are less commonly assigned by tooling;
+        // we leave them through so legitimate corporate LANs in that range still work.
+        // The name-based filter (IsVirtualAdapterName) is the primary defense for adapters
+        // with names like "br-*", "docker*", "vEthernet", etc.
+        if (ip.StartsWith("172.", StringComparison.Ordinal))
+        {
+            var parts = ip.Split('.');
+            if (parts.Length >= 2 && int.TryParse(parts[1], out var oct) && oct >= 17 && oct <= 24)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool IsRfc1918_172(string ip)
+    {
+        var parts = ip.Split('.');
+        return parts.Length >= 2 && int.TryParse(parts[1], out var oct) && oct >= 16 && oct <= 31;
+    }
+
+    private static int ScoreNetworkInterface(NetworkInterfaceType type, string ip)
+    {
+        // Prefer RFC-1918 private ranges (real LAN) vs others
+        bool isPrivateLan = ip.StartsWith("192.168.", StringComparison.Ordinal)
+                         || ip.StartsWith("10.", StringComparison.Ordinal)
+                         || (ip.StartsWith("172.", StringComparison.Ordinal) && IsRfc1918_172(ip));
+
+        return type switch
+        {
+            NetworkInterfaceType.Ethernet => isPrivateLan ? 100 : 60,
+            NetworkInterfaceType.Wireless80211 => isPrivateLan ? 90 : 50,
+            NetworkInterfaceType.GigabitEthernet => isPrivateLan ? 100 : 60,
+            NetworkInterfaceType.FastEthernetT => isPrivateLan ? 100 : 60,
+            _ => isPrivateLan ? 20 : 5,
+        };
     }
 
     private static FiestaDiscoveredWorker CloneDiscoveredWorker(FiestaDiscoveredWorker worker) =>
